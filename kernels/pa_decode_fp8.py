@@ -4,6 +4,14 @@
 """
 Supports kv_block_size=16 (original) and kv_block_size=1024 (trans_v required).
 
+Sliding window attention is supported via the ``sliding_window`` parameter of
+``build_pa_decode_module()``.  When ``sliding_window > 0``, only the last
+``sliding_window`` tokens of each sequence's context are attended to.
+Partition offsets and masking are adjusted so that no GPU work is wasted on
+out-of-window KV blocks.  The caller should set ``num_partitions`` based on
+``ceil(min(max_ctx_len, sliding_window) / KV_COMPUTE_BLOCK)`` rather than
+the full context length.
+
 Contains:
   - build_pa_decode_module(): main decode dot-product kernel
   - build_ps_reduce_kernel(): fixed-partition-count reduce kernel
@@ -71,6 +79,7 @@ def build_pa_decode_module(
     trans_v=False,
     one_shot=False,
     ps_num_splits=0,
+    sliding_window=0,
 ):
     global allocator
     arch = get_hip_arch()
@@ -112,6 +121,9 @@ def build_pa_decode_module(
 
     _ps_mode = ps_num_splits > 0
     _max_pps = _math.ceil(num_partitions / ps_num_splits) if _ps_mode else 1
+
+    _use_sliding_window = sliding_window > 0
+    _sliding_window = sliding_window
 
     allocator = SmemAllocator(None, arch=arch, global_sym_name="pa_smem")
     q_off = 0
@@ -213,6 +225,11 @@ def build_pa_decode_module(
         from flydsl.expr.utils.arith import int_to_int as _int_cast
         from flydsl.expr.numeric import Int32 as _Int32, Int64 as _Int64
 
+        if _use_sliding_window:
+            _sw_diff = context_length_i32 - fx.Int32(_sliding_window)
+            _sw_positive = _sw_diff > fx.Int32(0)
+            window_start = _sw_positive.select(_sw_diff, fx.Int32(0))
+
         def _wave_max(x):
             w = x
             for sh in [32, 16, 8, 4, 2, 1]:
@@ -240,17 +257,28 @@ def build_pa_decode_module(
         def _issue_bt_k_loads(part_val):
             result = {}
             if _use_large_block:
-                bt_idx = part_val // _partitions_per_block
-                page_off_v = (part_val % _partitions_per_block) * KV_COMPUTE_BLOCK
-                partition_start_v = part_val * KV_COMPUTE_BLOCK
+                if _use_sliding_window:
+                    effective_start = window_start + part_val * KV_COMPUTE_BLOCK
+                    bt_idx = effective_start // _bs
+                    page_off_v = effective_start % _bs
+                    partition_start_v = effective_start
+                else:
+                    bt_idx = part_val // _partitions_per_block
+                    page_off_v = (part_val % _partitions_per_block) * KV_COMPUTE_BLOCK
+                    partition_start_v = part_val * KV_COMPUTE_BLOCK
                 _bt_seq_base = seq * c_bt + bt_idx
                 phys_block_v = buffer_ops.buffer_load(bt_rsrc, _bt_seq_base, vec_width=1, dtype=T.i32)
                 phys_list = [phys_block_v, phys_block_v, phys_block_v, phys_block_v]
                 result['phys_block'] = phys_block_v
                 result['page_off'] = page_off_v
             else:
-                bt_start = part_val * _blocks_per_partition
-                partition_start_v = part_val * KV_COMPUTE_BLOCK
+                if _use_sliding_window:
+                    effective_start = window_start + part_val * KV_COMPUTE_BLOCK
+                    bt_start = effective_start // _bs
+                    partition_start_v = effective_start
+                else:
+                    bt_start = part_val * _blocks_per_partition
+                    partition_start_v = part_val * KV_COMPUTE_BLOCK
                 _bt_seq_base = seq * c_bt + bt_start
                 phys_0_v = buffer_ops.buffer_load(bt_rsrc, _bt_seq_base + warp_id, vec_width=1, dtype=T.i32)
                 phys_1_v = buffer_ops.buffer_load(
@@ -342,8 +370,12 @@ def build_pa_decode_module(
                     kv_tok = partition_start + warp_id * 64 + fx.Int32(n_tile * 16 + elem)
                     in_b = kv_tok < ctx_len
                     v = vector.extract(acc_qk[n_tile], static_position=[elem], dynamic_position=[])
+                    masked_v = in_b.select(v, NEG_INF)
+                    if _use_sliding_window:
+                        in_window = kv_tok >= window_start
+                        masked_v = in_window.select(masked_v, NEG_INF)
                     acc_qk[n_tile] = vector.insert(
-                        in_b.select(v, NEG_INF), acc_qk[n_tile], static_position=[elem], dynamic_position=[]
+                        masked_v, acc_qk[n_tile], static_position=[elem], dynamic_position=[]
                     )
 
             # -- STEP 7: BT LDS staging (for V loads) --
