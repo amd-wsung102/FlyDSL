@@ -9,25 +9,6 @@ Fuses softmax + top-K selection + optional renormalization for MoE gating:
   2. top-K selection   = K iterations of argmax-then-mask
   3. renormalize       = rescale K selected weights to sum to 1.0
 
-Multi-token-per-block layout (vLLM-style packing):
-
-  - ``VPT`` experts are loaded per thread (largest power-of-2 such that
-    ``num_experts // VPT`` is a power of 2 <= WARP_SIZE)
-  - ``THREADS_PER_TOKEN = num_experts // VPT`` consecutive lanes within a
-    single warp serve one token
-  - ``TOKENS_PER_BLOCK = WARPS_PER_BLOCK * (WARP_SIZE / THREADS_PER_TOKEN)``
-    tokens are packed per block
-  - All reductions are sub-warp butterfly shuffles with ``width=THREADS_PER_TOKEN``
-    (no shared memory, no barriers, no inter-warp sync)
-  - The leader of each per-token group (``expert_lane == 0``) writes the K
-    weights / indices / token_expert_indices for its global token row
-
-For ``num_experts=128`` on a 64-wide wave the auto-picker selects
-``VPT=16, THREADS_PER_TOKEN=8, TOKENS_PER_BLOCK=32`` — *more* aggressive
-packing than vLLM's ``ROWS_PER_WARP=16`` kernel (which uses 16 tokens/block
-with VPT=8). At ``num_experts=128, topk=4, bf16, renormalize=True`` this
-beats vLLM's ``topkGatingSoftmax`` on-GPU (~3.6us vs ~5.3us median on gfx950).
-
 Outputs: topk_weights (f32), topk_indices (i32), token_expert_indices (i32).
 """
 
@@ -65,7 +46,6 @@ def _pick_layout(num_experts: int):
 
     For ``num_experts=128`` on a 64-wide wave this picks ``(VPT=16, TPT=8)``
     (TOKENS_PER_BLOCK=32). vLLM's ``topkGatingSoftmax`` uses VPT=8 / TPT=16
-    instead; both work, ours just packs twice as many tokens per block.
     """
     for vpt in [16, 8, 4, 2, 1]:
         if num_experts % vpt != 0:
@@ -115,12 +95,6 @@ def build_topk_gating_softmax_module(
     if topk > num_experts:
         raise ValueError(f"topk={topk} > num_experts={num_experts}")
 
-    # Per-atom load width. We chunk the per-thread VPT-element load into
-    # narrow buffer copies because FlyDSL's per-thread-varying first-axis
-    # `fx.slice` does not currently lower a single wide buffer load cleanly
-    # (a 128-bit copy ends up as a v16bf16 BUFFER_LOAD that the AMDGPU
-    # backend cannot select). 32-bit atoms (2 bf16 per call) are the widest
-    # selectable form, so each thread issues VPT * elem_bits / 32 loads.
     if elem_bits <= 16 and VPT % 8 == 0:
         ATOM_BITS = 128                     # 8 bf16/f16 per atom call
     elif elem_bits <= 16 and VPT % 4 == 0:
@@ -134,7 +108,7 @@ def build_topk_gating_softmax_module(
     ELEMS_PER_ATOM = ATOM_BITS // elem_bits
     ATOMS_PER_THREAD = VPT // ELEMS_PER_ATOM
 
-    # No shared memory needed — every reduction stays inside a sub-warp lane group.
+    # No shared memory used — every reduction stays inside a sub-warp lane group.
     allocator = SmemAllocator(None, arch=arch)
 
     @flyc.kernel
@@ -174,9 +148,6 @@ def build_topk_gating_softmax_module(
 
         in_range = global_token < i32_num_tokens
 
-        # Clamp the row index for OOB threads so the buffer slice is well-formed.
-        # Buffer descriptors mask OOB loads, but we still want the *base* row
-        # to be a valid SSA value for `fx.slice`.
         global_token_safe = in_range.select(global_token, fx.Int32(0))
 
         # ── Sub-warp reductions over the THREADS_PER_TOKEN-lane group ────
