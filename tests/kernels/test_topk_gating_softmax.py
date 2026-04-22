@@ -72,12 +72,19 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
         return False, None
 
     torch.manual_seed(42)
+    torch_dtype = _torch_dtype(dtype_str)
     gating_fp32 = (
         torch.rand((num_tokens, num_experts), device="cuda", dtype=DTYPE_FP32) * 4.0
     ) - 2.0
+    # Quantize to the kernel's input dtype FIRST so the reference sees the
+    # exact bytes the kernel sees. Otherwise the K-th expert can flip at
+    # bf16/f16 precision boundaries (both vLLM and FlyDSL pick a different
+    # near-tie expert than fp32-softmax does).
+    gating_dev = gating_fp32.to(torch_dtype).contiguous()
+    gating_for_ref = gating_dev.to(DTYPE_FP32)
 
     # --- PyTorch reference ---
-    probs_ref = torch.softmax(gating_fp32, dim=1)
+    probs_ref = torch.softmax(gating_for_ref, dim=1)
     ref_weights, ref_indices = torch.topk(probs_ref, topk, dim=1)
     if renormalize:
         ref_weights = ref_weights / ref_weights.sum(dim=1, keepdim=True).clamp(min=1e-20)
@@ -90,8 +97,6 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
         ref_tei[:, k] = k * num_tokens + torch.arange(num_tokens, device="cuda", dtype=torch.int32)
 
     # --- Device tensors ---
-    torch_dtype = _torch_dtype(dtype_str)
-    gating_dev = gating_fp32.to(torch_dtype).contiguous()
     topk_weights_dev = torch.empty(
         (num_tokens, topk), device="cuda", dtype=DTYPE_FP32
     )
