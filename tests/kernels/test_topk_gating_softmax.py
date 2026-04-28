@@ -143,21 +143,45 @@ def run_test(num_tokens, num_experts, topk, dtype_str, renormalize=True):
     atol_weight = 2e-2 if dtype_str in ("bf16", "f16") else 1e-5
     passed = True
 
-    # 1. Check topk_indices: the selected expert sets should match
-    #    (order within top-K may differ with tied values, so compare as sets per row)
+    # 1. Check topk_indices: every kernel-selected expert must be a valid
+    #    top-K choice. We compare against the K-th largest reference
+    #    probability rather than torch.topk's specific index set, since
+    #    torch.topk and the kernel may legitimately disagree on which
+    #    experts to take when several share the boundary probability
+    #    (a common bf16/f16 quantization artifact).
     got_indices = topk_indices_dev.cpu()
     exp_indices = ref_indices.cpu()
 
-    indices_match = 0
+    probs_ref_cpu = probs_ref.cpu()
+    # K-th largest reference probability per row (the top-K threshold).
+    kth_threshold, _ = torch.topk(probs_ref_cpu, topk, dim=1)
+    kth_threshold = kth_threshold[:, -1]
+    # Probability tolerance: bf16/f16 representable gap between adjacent values
+    # near the typical softmax magnitude is ~1e-3; f32 is much tighter.
+    prob_tol = 1e-3 if dtype_str in ("bf16", "f16") else 1e-6
+
+    indices_match = 0   # strict set equality with torch.topk (informational)
+    indices_valid = 0   # every selected expert is at-or-above the K-th threshold
     for row in range(num_tokens):
-        got_set = set(got_indices[row].tolist())
-        exp_set = set(exp_indices[row].tolist())
-        if got_set == exp_set:
+        got_list = got_indices[row].tolist()
+        if set(got_list) == set(exp_indices[row].tolist()):
             indices_match += 1
+        if len(set(got_list)) == topk:
+            row_thr = kth_threshold[row].item() - prob_tol
+            if all(probs_ref_cpu[row, idx].item() >= row_thr for idx in got_list):
+                indices_valid += 1
     indices_pct = 100.0 * indices_match / num_tokens
-    print(f"  Indices match: {indices_match}/{num_tokens} rows ({indices_pct:.1f}%)")
-    if indices_pct < 99.0:
-        print("  FAILED: too many index mismatches")
+    valid_pct = 100.0 * indices_valid / num_tokens
+    print(
+        f"  Indices match torch.topk: {indices_match}/{num_tokens} rows "
+        f"({indices_pct:.1f}%; ties at the K-th boundary may diverge)"
+    )
+    print(
+        f"  Indices valid (>= K-th prob): {indices_valid}/{num_tokens} rows "
+        f"({valid_pct:.1f}%)"
+    )
+    if valid_pct < 100.0:
+        print("  FAILED: kernel selected experts below the top-K threshold")
         passed = False
 
     # 2. Check topk_weights: for matching rows, compare sorted weights
