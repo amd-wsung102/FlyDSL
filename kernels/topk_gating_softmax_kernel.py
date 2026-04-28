@@ -339,11 +339,9 @@ def build_topk_gating_softmax_module(
         # ==================================================================
         # Pass 5: Leader writes weights/indices/tei (with optional renorm)
         # ==================================================================
-        # Only the leader of each in-range token group touches global memory.
-        if renormalize:
-            c_eps = arith.constant(1e-20, type=compute_type)
-            denom = selected_sum.maximumf(c_eps)
-            inv_denom = c_one_f / ArithValue(denom)
+        c_eps = arith.constant(1e-20, type=compute_type)
+        denom = selected_sum.maximumf(c_eps)
+        inv_denom = c_one_f / ArithValue(denom)
 
         # Inline the leader-active predicate so the AST rewriter recognises it
         # as a dynamic test (it must contain a Call) and lowers `if ...` to
