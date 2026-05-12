@@ -27,17 +27,67 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf, memref as memref_ops
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, gpu, buffer_ops, const_expr, range_constexpr, vector as fly_vector
+from flydsl.expr import arith, gpu, buffer_ops, const_expr, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from kernels.kernels_common import get_warp_size
-
+import torch
 BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
+WARP_SIZE = get_warp_size()
+
+# DPP constants for prefix sum (used by decode, prefill, meshless)
+DPP_ROW_SHR_1 = 0x111
+DPP_ROW_SHR_2 = 0x112
+DPP_ROW_SHR_4 = 0x114
+DPP_ROW_SHR_8 = 0x118
+DPP_ROW_MASK = 0xF
+DPP_BANK_MASK = 0xF
+
+
+def _unwrap_val(v):
+    """Unwrap DSL value to raw MLIR ir.Value."""
+    return v.ir_value() if hasattr(v, 'ir_value') else v
+
+
+def _dpp_intra_wave_prefix_sum(val, lane, WARP_SIZE):
+    """inclusive prefix sum within a single wave using DPP.
+
+    Performs 4 DPP row_shr steps (1, 2, 4, 8) for intra-row scan, then
+    2 ds_bpermute steps (16, 32) for cross-row accumulation within the wave.
+    Returns the inclusive prefix sum value for each lane.
+
+    Call inside @flyc.kernel only — emits MLIR ops during tracing.
+    """
+    val_raw = _unwrap_val(val)
+    zero_raw = _unwrap_val(fx.Int32(0))
+
+    for shift, dpp_op, threshold in [
+        (1, DPP_ROW_SHR_1, 1),
+        (2, DPP_ROW_SHR_2, 2),
+        (4, DPP_ROW_SHR_4, 4),
+        (8, DPP_ROW_SHR_8, 8),
+    ]:
+        remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
+                                      dpp_op, DPP_ROW_MASK, DPP_BANK_MASK, True)
+        val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+        val_raw = _unwrap_val(val)
+
+    src_lane_16 = (lane & fx.Int32(0x30)) - fx.Int32(1)
+    remote16 = fly_rocdl.ds_bpermute(T.i32, src_lane_16 * fx.Int32(4), val)
+    val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
+
+    if WARP_SIZE > 32:
+        src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
+        remote32 = fly_rocdl.ds_bpermute(T.i32, src_lane_32 * fx.Int32(4), val)
+        val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
+
+    return val
+
 
 # ---------------------------------------------------------------------------
 # AOT-compiled dispatch caches — keyed by constexpr values.
@@ -47,6 +97,7 @@ UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
 # ---------------------------------------------------------------------------
 _decode_cf_cache = {}   # (num_experts, topk, max_tokens, unit_size, n_grid_blocks) -> CompiledFunction
 _prefill_cf_cache = {}  # (num_experts, topk, unit_size, kernel_name, *constexpr_vals) -> CompiledFunction
+_dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
 
 
 @contextmanager
@@ -71,6 +122,7 @@ def compile_moe_sorting_decode(
     topk: int,
     max_tokens: int = 128,
     unit_size: int = UNIT_SIZE,
+    has_mask: bool = False,
 ):
     """Compile the decode-path MoE sorting kernel.
 
@@ -86,7 +138,6 @@ def compile_moe_sorting_decode(
         GEMM tile-M for padding alignment (default 32).
     """
     arch = get_hip_arch()
-    WARP_SIZE = get_warp_size(arch)
     NUM_WAVES = BLOCK_SIZE // WARP_SIZE
     E = num_experts
     smem_cols = E + 1
@@ -164,11 +215,12 @@ def compile_moe_sorting_decode(
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
     ):
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
+        bid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
         tokens = i32_tokens
@@ -185,6 +237,7 @@ def compile_moe_sorting_decode(
         sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights_out, max_size=True)
         sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
         nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
         # LDS: get RAW memrefs ONCE — dominates all child scf.for/scf.if regions.
         base_ptr = allocator.get_base()
@@ -200,26 +253,28 @@ def compile_moe_sorting_decode(
         c_sentinel = fx.Int32((topk << 24))
 
         # =================== MOE_BUF ZEROING (blocks > 0 only) ===============
-        is_zero_block = arith.cmpi(arith.CmpIPredicate.ne, bid, c_zero_i32)
-        _if_zero = scf.IfOp(is_zero_block)
+        is_zero_block = (bid != c_zero_i32)
+        _if_zero = scf.IfOp(is_zero_block.ir_value())
         with _if_then(_if_zero):
-            zero_gid = (bid - c_one_i32) * fx.Int32(BLOCK_SIZE) + tid
-            num_zero_blocks = fx.grid_dim.x - c_one_i32
-            zero_stride = num_zero_blocks * fx.Int32(BLOCK_SIZE)
-            # Opt 10: compute loop bound from moe_buf_elems / stride (avoid 255 wasted iterations)
-            zero_niters = (i32_moe_buf_elems + zero_stride - c_one_i32) // zero_stride
-            _zs = arith.index(0)
+            zero_gid_v4 = (bid - c_one_i32) * fx.Int32(BLOCK_SIZE) + tid
+            num_zero_blocks = gpu.grid_dim.x - c_one_i32
+            zero_stride_v4 = num_zero_blocks * fx.Int32(BLOCK_SIZE)
+            i32_moe_buf_v4 = i32_moe_buf_elems >> fx.Int32(2)
+            zero_niters = (i32_moe_buf_v4 + zero_stride_v4 - c_one_i32) // zero_stride_v4
+            _zs = fx.Index(0)
             _ze = ArithValue(zero_niters).index_cast(T.index)
-            _z1 = arith.index(1)
+            _z1 = fx.Index(1)
+            c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
+            c4_i32 = fx.Int32(4)
             for _z in range(_zs, _ze, _z1):
-                z_idx = zero_gid + fx.Int32(_z) * zero_stride
-                z_valid = z_idx < i32_moe_buf_elems
-                z_safe = z_valid.select(z_idx, c_oob_idx)
-                buffer_ops.buffer_store(c_zero_i32, moe_buf_rsrc, z_safe)
+                z_idx_v4 = zero_gid_v4 + fx.Int32(_z) * zero_stride_v4
+                z_valid = z_idx_v4 < i32_moe_buf_v4
+                z_elem = z_valid.select(z_idx_v4 * c4_i32, c_oob_idx)
+                buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
 
         # =================== SORTING (block 0 only) ==========================
-        is_sort_block = arith.cmpi(arith.CmpIPredicate.eq, bid, c_zero_i32)
-        _if_sort = scf.IfOp(is_sort_block)
+        is_sort_block = (bid == c_zero_i32)
+        _if_sort = scf.IfOp(is_sort_block.ir_value())
         with _if_then(_if_sort):
             # ========================= PHASE 1: Histogram =========================
             # Clear mesh region — unconditional store to safe index when out of bounds
@@ -245,9 +300,12 @@ def compile_moe_sorting_decode(
                 global_idx = token_id * c_topk + topk_slot
                 eid = buffer_ops.buffer_load(topk_ids_rsrc, global_idx, vec_width=1, dtype=T.i32)
 
-                # mesh[token_id, eid] = topk_slot + 1; invalid threads write 0 to index 0
+                # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
+                # Invalid threads must NOT write to mesh[0] — that would race
+                # with a valid write to (token=0, expert=0).
                 mesh_addr = token_id * c_smem_cols + eid
-                safe_mesh_addr = is_valid.select(mesh_addr, c_zero_i32)
+                last_mesh_idx = fx.Int32(sub_tokens * smem_cols - 1)
+                safe_mesh_addr = is_valid.select(mesh_addr, last_mesh_idx)
                 safe_mesh_ix = ArithValue(safe_mesh_addr).index_cast(T.index)
                 val = is_valid.select(topk_slot + c_one_i32, c_zero_i32)
                 _lds_store(mesh_mr, val, safe_mesh_ix)
@@ -284,7 +342,7 @@ def compile_moe_sorting_decode(
                     mesh_val = _lds_load(mesh_mr, mesh_rd_ix)
 
                     has_token = combined_valid.select(
-                        arith.cmpi(arith.CmpIPredicate.ne, mesh_val, c_zero_i32).select(c_one_i32, c_zero_i32),
+                        (mesh_val != c_zero_i32).select(c_one_i32, c_zero_i32),
                         c_zero_i32,
                     )
 
@@ -316,11 +374,27 @@ def compile_moe_sorting_decode(
                 cvt_ix = ArithValue(safe_cvt_idx).index_cast(T.index)
                 raw_cnt_cvt = _lds_load(cumsum_mr, cvt_ix)
                 blocks_cvt = (raw_cnt_cvt + c_unit - c_one_i32) // c_unit
-                padded_cvt = arith.cmpi(arith.CmpIPredicate.eq, raw_cnt_cvt, c_zero_i32).select(
+                padded_cvt = (raw_cnt_cvt == c_zero_i32).select(
                     c_zero_i32, blocks_cvt * c_unit)
                 # Valid threads write padded value; invalid threads write 0 to cumsum[0]
                 _lds_store(cumsum_mr, cvt_valid.select(padded_cvt, c_zero_i32), cvt_ix)
             gpu.barrier()
+
+            if has_mask:
+                # EP: zero padded count for masked experts in a separate pass.
+                # Loading from mask buffer inside the padded-count loop above interfered
+                # with expert 0 (MLIR codegen issue). Separate pass avoids this.
+                for i_ep in range_constexpr(0, E, BLOCK_SIZE):
+                    ep_eid = fx.Int32(i_ep) + tid
+                    ep_valid = ep_eid < c_E
+                    ep_safe_eid = ep_valid.select(ep_eid, c_zero_i32)
+                    ep_m = buffer_ops.buffer_load(mask_rsrc, ep_safe_eid, vec_width=1, dtype=T.i32)
+                    should_zero = ep_valid & (ep_m == c_zero_i32)
+                    ep_cs_ix = ArithValue(ep_valid.select(ep_eid + c_one_i32, c_zero_i32)).index_cast(T.index)
+                    _lds_store(cumsum_mr,
+                               should_zero.select(c_zero_i32, _lds_load(cumsum_mr, ep_cs_ix)),
+                               ep_cs_ix)
+                gpu.barrier()
 
             # Step 2: Parallel prefix sum using DPP row_shr + ds_bpermute.
             # Wave 0 does the prefix sum; other waves idle.
@@ -332,13 +406,6 @@ def compile_moe_sorting_decode(
             is_wave0 = wave == c_zero_i32
             prev_chunk_total = c_zero_i32
 
-            # DPP constants
-            DPP_ROW_SHR_1 = 0x111
-            DPP_ROW_SHR_2 = 0x112
-            DPP_ROW_SHR_4 = 0x114
-            DPP_ROW_SHR_8 = 0x118
-            DPP_ROW_MASK = 0xF
-            DPP_BANK_MASK = 0xF
 
             for chunk_start in range_constexpr(0, E, WARP_SIZE):
                 # Each lane handles one expert in this chunk
@@ -348,55 +415,7 @@ def compile_moe_sorting_decode(
                 ps_ix = ArithValue(safe_eid_ps).index_cast(T.index)
                 val = eid_ps_valid.select(_lds_load(cumsum_mr, ps_ix), c_zero_i32)
 
-                # Hillis-Steele inclusive prefix sum:
-                # Steps 0-3 (shift 1,2,4,8) use DPP row_shr (intra-row, 1 cycle)
-                # Steps 4-5 (shift 16,32) use ds_bpermute (cross-row)
-                val_raw = _unwrap(val)
-                zero_raw = _unwrap(c_zero_i32)
-
-                # DPP row_shr:1 — shift right by 1 within 16-lane row
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                              DPP_ROW_SHR_1, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                should_add = lane >= c_one_i32
-                val = should_add.select(val + fx.Int32(remote), val)
-
-                # DPP row_shr:2
-                val_raw = _unwrap(val)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                              DPP_ROW_SHR_2, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                should_add = lane >= fx.Int32(2)
-                val = should_add.select(val + fx.Int32(remote), val)
-
-                # DPP row_shr:4
-                val_raw = _unwrap(val)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                              DPP_ROW_SHR_4, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                should_add = lane >= fx.Int32(4)
-                val = should_add.select(val + fx.Int32(remote), val)
-
-                # DPP row_shr:8
-                val_raw = _unwrap(val)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                              DPP_ROW_SHR_8, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                should_add = lane >= fx.Int32(8)
-                val = should_add.select(val + fx.Int32(remote), val)
-
-                if WARP_SIZE > 16:
-                    # Cross-row: shift by 16 via ds_bpermute
-                    # Read from last lane of previous row: (lane & 0x30) - 1
-                    src_lane_16 = (lane & fx.Int32(0x30)) - c_one_i32
-                    src_addr_16 = src_lane_16 * c4_i32
-                    remote16 = fly_rocdl.ds_bpermute(T.i32, src_addr_16, val)
-                    should_add16 = lane >= fx.Int32(16)
-                    val = should_add16.select(val + fx.Int32(remote16), val)
-
-                if WARP_SIZE > 32:
-                    # Cross-row: shift by 32 via ds_bpermute
-                    src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-                    src_addr_32 = src_lane_32 * c4_i32
-                    remote32 = fly_rocdl.ds_bpermute(T.i32, src_addr_32, val)
-                    should_add32 = lane >= fx.Int32(32)
-                    val = should_add32.select(val + fx.Int32(remote32), val)
+                val = _dpp_intra_wave_prefix_sum(val, lane, WARP_SIZE)
 
                 # Add previous chunk's total
                 val = val + prev_chunk_total
@@ -431,7 +450,54 @@ def compile_moe_sorting_decode(
                 _lds_store(cumsum_mr, cp_val, cp_ix)
             gpu.barrier()
 
+            if has_mask:
+                # EP: Compute mask cumsum in cumdup for local expert index mapping.
+                # cumdup[eid] = exclusive prefix sum of mask[0..eid-1] = local expert index.
+                for i_ml in range_constexpr(0, E, BLOCK_SIZE):
+                    ml_eid = fx.Int32(i_ml) + tid
+                    ml_valid = ml_eid < c_E
+                    safe_ml_eid = ml_valid.select(ml_eid, c_zero_i32)
+                    ml_mask = buffer_ops.buffer_load(
+                        mask_rsrc, safe_ml_eid, vec_width=1, dtype=T.i32)
+                    ml_val = ml_valid.select(ml_mask, c_zero_i32)
+                    ml_ix = ArithValue(ml_valid.select(ml_eid + c_one_i32, c_zero_i32)).index_cast(T.index)
+                    _lds_store(cumdup_mr, ml_val, ml_ix)
+                _lds_store(cumdup_mr, is_t0.select(c_zero_i32, _lds_load(cumdup_mr, c_zero_i32)), c_zero_i32)
+                gpu.barrier()
+
+                # DPP prefix sum over mask values in cumdup (wave 0)
+                prev_chunk_total_m = c_zero_i32
+                for chunk_start_m in range_constexpr(0, E, WARP_SIZE):
+                    eid_m = fx.Int32(chunk_start_m) + lane
+                    eid_m_valid = is_wave0 & (eid_m < c_E)
+                    safe_eid_m = eid_m_valid.select(eid_m + c_one_i32, c_zero_i32)
+                    m_ix = ArithValue(safe_eid_m).index_cast(T.index)
+                    mval = eid_m_valid.select(_lds_load(cumdup_mr, m_ix), c_zero_i32)
+
+                    mval = _dpp_intra_wave_prefix_sum(mval, lane, WARP_SIZE)
+
+                    mval = mval + prev_chunk_total_m
+                    _lds_store(cumdup_mr, eid_m_valid.select(mval, c_zero_i32),
+                               eid_m_valid.select(eid_m + c_one_i32, c_zero_i32))
+
+                    last_addr_m = fx.Int32((WARP_SIZE - 1) * 4)
+                    prev_chunk_total_m = fly_rocdl.ds_bpermute(T.i32, last_addr_m, mval)
+                    prev_chunk_total_m = fx.Int32(prev_chunk_total_m)
+
+                _lds_store(cumdup_mr, is_t0.select(c_zero_i32, _lds_load(cumdup_mr, c_zero_i32)), c_zero_i32)
+                gpu.barrier()
+            else:
+                # No mask: cumdup[eid] = eid (identity mapping)
+                for i_ml in range_constexpr(0, E, BLOCK_SIZE):
+                    ml_eid = fx.Int32(i_ml) + tid
+                    ml_valid = ml_eid < c_E
+                    safe_ml_eid = ml_valid.select(ml_eid, c_zero_i32)
+                    ml_ix = ArithValue(safe_ml_eid).index_cast(T.index)
+                    _lds_store(cumdup_mr, ml_valid.select(safe_ml_eid, c_zero_i32), ml_ix)
+                gpu.barrier()
+
             # Write sorted_expert_ids — predicated stores to buffer (safe: buffer_store ignores OOB)
+            # EP: use cumdup[eid] as local expert index instead of global eid
             for i_eid in range_constexpr(0, E, BLOCK_SIZE):
                 eid_wr = fx.Int32(i_eid) + tid
                 eid_wr_valid = eid_wr < c_E
@@ -441,9 +507,10 @@ def compile_moe_sorting_decode(
                 cs_end_ix = ArithValue(safe_eid_wr + c_one_i32).index_cast(T.index)
                 e_start = _lds_load(cumsum_mr, cs_start_ix)
                 e_end = eid_wr_valid.select(_lds_load(cumsum_mr, cs_end_ix), e_start)
+                local_eid = _lds_load(cumdup_mr, cs_start_ix)
 
-                # Store cumdup: valid threads write e_start to cumdup[eid],
-                # invalid threads write cumsum[0]=0 to cumdup[0] (harmless).
+                # Store cumdup: reuse cumdup for scatter phase position tracking.
+                # Write e_start to cumdup[eid] (overwriting mask cumsum, no longer needed).
                 _lds_store(cumdup_mr, e_start, cs_start_ix)
 
                 blk_start = e_start // c_unit
@@ -451,9 +518,8 @@ def compile_moe_sorting_decode(
                 for j_blk in range_constexpr(max_tokens):
                     blk_idx = blk_start + fx.Int32(j_blk)
                     blk_valid = eid_wr_valid & (blk_idx < blk_end)
-                    # buffer_store with predicated index (OOB writes are dropped by HW)
                     safe_blk = blk_valid.select(blk_idx, c_oob_idx)
-                    buffer_ops.buffer_store(eid_wr, sorted_e_rsrc, safe_blk)
+                    buffer_ops.buffer_store(local_eid, sorted_e_rsrc, safe_blk)
             gpu.barrier()
 
             # Store cumdup[E] = cumsum[E].
@@ -474,24 +540,30 @@ def compile_moe_sorting_decode(
                 # cumsum[0] to avoid racing with lane_group 0's position write-back.
                 safe_eid_sc = eid_sc_valid.select(eid_sc, c_E)
 
+                sc_expert_enabled = eid_sc_valid
+                if has_mask:
+                    # EP: check if this expert is masked (skip scatter for masked experts)
+                    sc_mask_val = buffer_ops.buffer_load(
+                        mask_rsrc, eid_sc_valid.select(eid_sc, c_zero_i32),
+                        vec_width=1, dtype=T.i32)
+                    sc_expert_enabled = eid_sc_valid & (sc_mask_val != c_zero_i32)
+
                 cs_sc_ix = ArithValue(safe_eid_sc).index_cast(T.index)
                 position = _lds_load(cumsum_mr, cs_sc_ix)
 
                 for i_sub2 in range_constexpr(0, sub_tokens, 8):
                     # This lane handles sub_token (i_sub2 + lane_group_os).
                     my_sub = fx.Int32(i_sub2) + lane_group_os
-                    my_sub_valid = eid_sc_valid & (my_sub < c_sub_tokens)
+                    my_sub_valid = sc_expert_enabled & (my_sub < c_sub_tokens)
                     safe_my_sub = my_sub_valid.select(my_sub, c_zero_i32)
                     my_mesh_addr = safe_my_sub * c_smem_cols + safe_eid_sc
                     my_mesh_ix = ArithValue(my_mesh_addr).index_cast(T.index)
                     my_x = _lds_load(mesh_mr, my_mesh_ix)
-                    my_has_token = my_sub_valid & arith.cmpi(arith.CmpIPredicate.ne, my_x, c_zero_i32)
+                    my_has_token = my_sub_valid & (my_x != c_zero_i32)
                     local_cnt = my_has_token.select(c_one_i32, c_zero_i32)
 
-                    # Opt 7: DPP row_shr inclusive prefix sum within 8-lane group
-                    # (1-cycle register-to-register vs 2-4 cycle ds_bpermute via LDS)
-                    # row_shr operates within 16-lane rows; lane_group_os guard
-                    # handles 8-lane group boundaries (discards cross-group values).
+                    # 8-lane group prefix sum (NOT full-wave — uses lane_group_os,
+                    # only shifts 1,2,4, no cross-row bpermute needed).
                     cnt_raw = _unwrap(local_cnt)
                     zero_raw = _unwrap(c_zero_i32)
 
@@ -564,7 +636,6 @@ def compile_moe_sorting_decode(
                     # Both buffers start at the same base offset in element-width terms
                     buffer_ops.buffer_store(c_zero_as_i32, sorted_w_rsrc, safe_pad_slot)
 
-    # end kernel
 
     @flyc.jit
     def launch_moe_sorting_decode(
@@ -575,6 +646,7 @@ def compile_moe_sorting_decode(
         sorted_expert_ids: fx.Tensor,
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid_blocks: fx.Constexpr[int],
@@ -593,6 +665,7 @@ def compile_moe_sorting_decode(
             sorted_expert_ids,
             num_valid_ids_out,
             moe_buf,
+            expert_mask_tensor,
             i32_tokens,
             i32_moe_buf_elems,
         )
@@ -642,6 +715,7 @@ def compile_moe_sorting_prefill(
     num_experts: int,
     topk: int,
     unit_size: int = UNIT_SIZE,
+    has_mask: bool = False,
 ):
     """Compile the prefill-path MoE sorting kernels.
 
@@ -667,7 +741,6 @@ def compile_moe_sorting_prefill(
         GEMM tile-M for padding alignment (default 32).
     """
     arch = get_hip_arch()
-    WARP_SIZE = get_warp_size(arch)
     E = num_experts
 
     # --- K1: ClearWorkspace kernel -------------------------------------------
@@ -680,7 +753,7 @@ def compile_moe_sorting_prefill(
         workspace: fx.Tensor,
         i32_total_elems: fx.Int32,
     ):
-        gid = fx.block_idx.x * fx.Int32(K1_BLOCK) + fx.thread_idx.x
+        gid = gpu.block_idx.x * fx.Int32(K1_BLOCK) + gpu.thread_idx.x
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         c_zero = fx.Int32(0)
 
@@ -712,8 +785,8 @@ def compile_moe_sorting_prefill(
         i32_mesh_stride: fx.Int32,
         i32_niters: fx.Int32,
     ):
-        gid = fx.block_idx.x * fx.Int32(K2_BLOCK) + fx.thread_idx.x
-        stride = fx.grid_dim.x * fx.Int32(K2_BLOCK)
+        gid = gpu.block_idx.x * fx.Int32(K2_BLOCK) + gpu.thread_idx.x
+        stride = gpu.grid_dim.x * fx.Int32(K2_BLOCK)
         topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         c_zero = fx.Int32(0)
@@ -723,9 +796,9 @@ def compile_moe_sorting_prefill(
 
         total = i32_tokens * c_topk
 
-        _s = arith.index(0)
+        _s = fx.Index(0)
         _e = ArithValue(i32_niters).index_cast(T.index)
-        _one = arith.index(1)
+        _one = fx.Index(1)
         for _i in range(_s, _e, _one):
             flat = gid + fx.Int32(_i) * stride
             valid = flat < total
@@ -735,7 +808,7 @@ def compile_moe_sorting_prefill(
             eid = buffer_ops.buffer_load(topk_rsrc, safe_flat, vec_width=1, dtype=T.i32)
             # uint8 mesh: byte_offset = eid * mesh_stride + token_id
             byte_offset = eid * i32_mesh_stride + token_id
-            val_i8 = arith.trunci(T.i8, topk_slot + c_one)
+            val_i8 = ArithValue(topk_slot + c_one).trunci(T.i8)
             # OOB offset for invalid threads (GPU silently drops OOB stores)
             safe_byte_off = valid.select(byte_offset, c_oob)
             buffer_ops.buffer_store(val_i8, ws_rsrc, safe_byte_off, offset_is_bytes=True)
@@ -764,18 +837,19 @@ def compile_moe_sorting_prefill(
     K3_WORDS_PER_ITER = K3_BLOCK * K3_VEC_WIDTH
     K3_WORDS_PER_ITER_LOG2 = (K3_WORDS_PER_ITER).bit_length() - 1
 
-    k3_allocator = SmemAllocator(None, arch=arch)
+    k3_allocator = SmemAllocator(None, arch=arch, global_sym_name="smem_storage_p1")
     k3_reduce_offset = k3_allocator._align(k3_allocator.ptr, 16)
     k3_allocator.ptr = k3_reduce_offset + K3_NUM_WAVES * 4
 
     @flyc.kernel
     def p1_count_kernel(
         workspace: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
     ):
-        eid = fx.block_idx.x
-        tid = fx.thread_idx.x
+        eid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
 
@@ -791,8 +865,17 @@ def compile_moe_sorting_prefill(
         i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
         n_iters = (i32_words_per_row + fx.Int32(K3_WORDS_PER_ITER - 1)) >> fx.Int32(K3_WORDS_PER_ITER_LOG2)
 
-        for _i, state in range(arith.index(0), ArithValue(n_iters).index_cast(T.index),
-                                arith.index(1), init=[c_zero]):
+        if has_mask:
+            mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
+            p1_mask = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
+            p1_is_local = (p1_mask != c_zero)
+            p1_should_zero = (~p1_is_local) & (tid == c_zero)
+            buffer_ops.buffer_store(c_zero, ws_rsrc,
+                                    p1_should_zero.select(i32_mesh_size + eid, fx.Int32(0x7FFFFFFF)))
+            n_iters = p1_is_local.select(n_iters, c_zero)
+
+        for _i, state in range(fx.Index(0), ArithValue(n_iters).index_cast(T.index),
+                                fx.Index(1), init=[c_zero]):
             cnt_so_far = state[0]
 
             word_base = fx.Int32(_i) * fx.Int32(K3_WORDS_PER_ITER) + tid * fx.Int32(K3_VEC_WIDTH)
@@ -802,7 +885,7 @@ def compile_moe_sorting_prefill(
 
             iter_cnt = c_zero
             for _wi in range_constexpr(K3_VEC_WIDTH):
-                word = fx.Int32(fly_vector.extract(vec4, static_position=[_wi], dynamic_position=[]))
+                word = Vec(vec4)[_wi]
                 word_valid = valid & ((word_base + fx.Int32(_wi)) < i32_words_per_row)
                 b0 = word & c_ff
                 b1 = (word >> fx.Int32(8)) & c_ff
@@ -826,8 +909,8 @@ def compile_moe_sorting_prefill(
             cnt = cnt + peer
 
         # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
-        is_lane0 = arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero)
-        _if_l0 = scf.IfOp(is_lane0)
+        is_lane0 = (lane == c_zero)
+        _if_l0 = scf.IfOp(is_lane0.ir_value())
         with _if_then(_if_l0):
             wave_ix = ArithValue(wave).index_cast(T.index)
             _lds_store_raw(reduce_mr, cnt, wave_ix)
@@ -847,6 +930,7 @@ def compile_moe_sorting_prefill(
     @flyc.jit
     def launch_p1(
         workspace: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -856,7 +940,7 @@ def compile_moe_sorting_prefill(
         with ir.InsertionPoint(ctx.gpu_module_body):
             k3_allocator.finalize()
 
-        launcher = p1_count_kernel(workspace, i32_mesh_stride, i32_mesh_size)
+        launcher = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
         launcher.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
 
     # --- P0_v2: Fused clear+scatter+count kernel (for small T) ---------------
@@ -873,7 +957,7 @@ def compile_moe_sorting_prefill(
     _p0v2_topk_log2 = topk.bit_length() - 1 if _p0v2_topk_is_po2 else 0
 
     # LDS for cross-wave reduction (same layout as K3)
-    p0v2_allocator = SmemAllocator(None, arch=arch)
+    p0v2_allocator = SmemAllocator(None, arch=arch, global_sym_name="smem_storage_p0v2")
     p0v2_reduce_offset = p0v2_allocator._align(p0v2_allocator.ptr, 16)
     p0v2_allocator.ptr = p0v2_reduce_offset + P0V2_NUM_WAVES * 4
 
@@ -881,19 +965,21 @@ def compile_moe_sorting_prefill(
     def p0v2_kernel(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
     ):
-        eid = fx.block_idx.x
-        tid = fx.thread_idx.x
+        eid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
 
-        topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-
+        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
+        topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         c_zero = fx.Int32(0)
+        c_oob = fx.Int32(0x7FFFFFFF)
         c_one = fx.Int32(1)
         c_ff = fx.Int32(0xFF)
         c_topk = fx.Int32(topk)
@@ -906,23 +992,31 @@ def compile_moe_sorting_prefill(
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
         i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
 
+        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+        total_assignments = i32_tokens * c_topk
+        scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+
+        # EP: load mask, write cumsum=0 for masked experts, set loop bounds to 0
+        if has_mask:
+            m_val = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
+            is_local_expert = (m_val != c_zero)
+            should_write_zero = (~is_local_expert) & (tid == c_zero)
+            buffer_ops.buffer_store(c_zero, ws_rsrc,
+                                    should_write_zero.select(i32_mesh_size + eid, c_oob))
+            clear_niters = is_local_expert.select(clear_niters, c_zero)
+            scatter_niters = is_local_expert.select(scatter_niters, c_zero)
+
         # ---- Phase 1: Clear this expert's mesh row ----
-        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)  # ceil div by 512
-        for _ci in range(arith.index(0), ArithValue(clear_niters).index_cast(T.index), arith.index(1)):
+        for _ci in range(fx.Index(0), ArithValue(clear_niters).index_cast(T.index), fx.Index(1)):
             word_idx = fx.Int32(_ci) * c_block + tid
             valid = word_idx < i32_words_per_row
             safe_idx = mesh_row_i32_base + valid.select(word_idx, c_zero)
-            buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(safe_idx, fx.Int32(0x7FFFFFFF)))
+            buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(safe_idx, c_oob))
 
         gpu.barrier()
 
         # ---- Phase 2: Scatter (scan all T*topk, filter by expert) ----
-        # Each block scans ALL T*topk assignments, writes only matching expert's
-        # tokens via byte store (same as K2). OOB index for non-matching threads.
-        c_oob = fx.Int32(0x7FFFFFFF)
-        total_assignments = i32_tokens * c_topk
-        scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
-        for _si in range(arith.index(0), ArithValue(scatter_niters).index_cast(T.index), arith.index(1)):
+        for _si in range(fx.Index(0), ArithValue(scatter_niters).index_cast(T.index), fx.Index(1)):
             flat = fx.Int32(_si) * c_block + tid
             valid = flat < total_assignments
             safe_flat = valid.select(flat, c_zero)
@@ -934,16 +1028,16 @@ def compile_moe_sorting_prefill(
 
             is_mine = valid & (expert_id == eid)
             byte_offset = eid * i32_mesh_stride + token_id
-            val_i8 = arith.trunci(T.i8, is_mine.select(topk_slot + c_one, c_zero))
+            val_i8 = ArithValue(is_mine.select(topk_slot + c_one, c_zero)).trunci(T.i8)
             safe_byte_off = is_mine.select(byte_offset, c_zero)
             buffer_ops.buffer_store(val_i8, ws_rsrc, safe_byte_off, offset_is_bytes=True)
 
         gpu.barrier()
 
         # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
-        count_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)  # ceil div by 512
-        for _ki, state in range(arith.index(0), ArithValue(count_niters).index_cast(T.index),
-                                arith.index(1), init=[c_zero]):
+        count_niters = clear_niters  # same loop structure, reuse (already EP-gated)
+        for _ki, state in range(fx.Index(0), ArithValue(count_niters).index_cast(T.index),
+                                fx.Index(1), init=[c_zero]):
             cnt_so_far = state[0]
 
             word_base = fx.Int32(_ki) * c_block + tid
@@ -973,8 +1067,8 @@ def compile_moe_sorting_prefill(
             cnt = cnt + peer
 
         # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
-        is_lane0 = arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero)
-        _if_l0 = scf.IfOp(is_lane0)
+        is_lane0 = (lane == c_zero)
+        _if_l0 = scf.IfOp(is_lane0.ir_value())
         with _if_then(_if_l0):
             wave_ix = ArithValue(wave).index_cast(T.index)
             _lds_store_raw(reduce_mr, cnt, wave_ix)
@@ -995,6 +1089,7 @@ def compile_moe_sorting_prefill(
     def launch_p0v2(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
@@ -1005,7 +1100,7 @@ def compile_moe_sorting_prefill(
         with ir.InsertionPoint(ctx.gpu_module_body):
             p0v2_allocator.finalize()
 
-        launcher = p0v2_kernel(topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_mesh_size)
+        launcher = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
         launcher.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
 
     # --- K4: P23 prefix-sum + scatter + moe_buf zeroing ---------------------
@@ -1023,13 +1118,6 @@ def compile_moe_sorting_prefill(
     k4_scatter_offset = k4_allocator._align(k4_allocator.ptr, 16)
     k4_allocator.ptr = k4_scatter_offset + K4_NUM_WAVES * 4
 
-    # DPP constants (same as decode)
-    DPP_ROW_SHR_1 = 0x111
-    DPP_ROW_SHR_2 = 0x112
-    DPP_ROW_SHR_4 = 0x114
-    DPP_ROW_SHR_8 = 0x118
-    DPP_ROW_MASK = 0xF
-    DPP_BANK_MASK = 0xF
 
     @flyc.kernel
     def p23_kernel(
@@ -1040,13 +1128,14 @@ def compile_moe_sorting_prefill(
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
     ):
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
+        bid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
         c_zero = fx.Int32(0)
@@ -1064,35 +1153,36 @@ def compile_moe_sorting_prefill(
         weights_rsrc = buffer_ops.create_buffer_resource(topk_weights_tensor, max_size=True)
         sorted_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
         sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights_out, max_size=True)
+        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
         # LDS: cumsum[E+1] for prefix sums + cross-wave scratch
         base_ptr = k4_allocator.get_base()
         cumsum_mr = SmemPtr(base_ptr, k4_cumsum_offset, T.i32, shape=(k4_smem_cols,)).get()
         scatter_mr = SmemPtr(base_ptr, k4_scatter_offset, T.i32, shape=(K4_NUM_WAVES,)).get()
 
-        is_sort_block = arith.cmpi(arith.CmpIPredicate.slt, bid, c_E)
-        is_zero_block = arith.cmpi(arith.CmpIPredicate.sge, bid, c_E)
+        is_sort_block = (bid < c_E)
+        is_zero_block = (bid >= c_E)
 
         # ================ MOE_BUF ZEROING (blocks >= E) ==================
-        _if_zero = scf.IfOp(is_zero_block)
+        _if_zero = scf.IfOp(is_zero_block.ir_value())
         with _if_then(_if_zero):
             moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
             zero_base_bid = bid - c_E
-            zero_gid = zero_base_bid * fx.Int32(K4_BLOCK) + tid
-            num_zero_blocks = fx.grid_dim.x - c_E
-            zero_stride = num_zero_blocks * fx.Int32(K4_BLOCK)
-            zero_niters = (i32_moe_buf_elems + zero_stride - c_one) // zero_stride
-            _zs = arith.index(0)
-            _ze = ArithValue(zero_niters).index_cast(T.index)
-            _z1 = arith.index(1)
-            for _z in range(_zs, _ze, _z1):
-                z_idx = zero_gid + fx.Int32(_z) * zero_stride
-                z_valid = z_idx < i32_moe_buf_elems
-                buffer_ops.buffer_store(c_zero, moe_buf_rsrc, z_valid.select(z_idx, c_zero))
+            zero_gid_v4 = zero_base_bid * fx.Int32(K4_BLOCK) + tid
+            num_zero_blocks = gpu.grid_dim.x - c_E
+            zero_stride_v4 = num_zero_blocks * fx.Int32(K4_BLOCK)
+            i32_moe_buf_v4 = i32_moe_buf_elems >> fx.Int32(2)
+            zero_niters = (i32_moe_buf_v4 + zero_stride_v4 - c_one) // zero_stride_v4
+            c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
+            for _z in range(fx.Index(0), ArithValue(zero_niters).index_cast(T.index), fx.Index(1)):
+                z_idx_v4 = zero_gid_v4 + fx.Int32(_z) * zero_stride_v4
+                z_valid = z_idx_v4 < i32_moe_buf_v4
+                z_elem = z_valid.select(z_idx_v4 * c4, c_oob_idx)
+                buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
 
         # ================ PARALLEL PREFIX-SUM + MESH SCATTER (blocks 0..E-1) ==
         # Each block independently: prefix sum (redundant), scatter for its expert only.
-        _if_sort = scf.IfOp(is_sort_block)
+        _if_sort = scf.IfOp(is_sort_block.ir_value())
         with _if_then(_if_sort):
             my_expert = bid
 
@@ -1102,54 +1192,27 @@ def compile_moe_sorting_prefill(
             raw_cnt = buffer_ops.buffer_load(ws_rsrc, ws_cs_addr, vec_width=1, dtype=T.i32)
             blocks = (raw_cnt + c_unit - c_one) >> fx.Int32(5)  # // 32
             padded = (raw_cnt == c_zero).select(c_zero, blocks * c_unit)
+            p23_mask_val = c_one
+            if has_mask:
+                # EP: zero padded count for masked experts.
+                p23_mask_val = buffer_ops.buffer_load(mask_rsrc, tid, vec_width=1, dtype=T.i32)
+                padded = (p23_mask_val == c_zero).select(c_zero, padded)
             # Write padded count to cumsum[tid+1]; thread 0 also writes cumsum[0]=0
             _lds_store_raw(cumsum_mr, padded, ArithValue(tid + c_one).index_cast(T.index))
-            is_t0_init = arith.cmpi(arith.CmpIPredicate.eq, tid, c_zero)
-            _if_init_cs = scf.IfOp(is_t0_init)
+            is_t0_init = (tid == c_zero)
+            _if_init_cs = scf.IfOp(is_t0_init.ir_value())
             with _if_then(_if_init_cs):
                 _lds_store_raw(cumsum_mr, c_zero, ArithValue(c_zero).index_cast(T.index))
             gpu.barrier()
 
             # Step 2: DPP inclusive prefix sum over cumsum LDS (all 256 threads, 4 waves)
             val = _lds_load_raw(cumsum_mr, ArithValue(tid + c_one).index_cast(T.index))
-            val_raw = _unwrap_raw(val)
-            zero_raw = _unwrap_raw(c_zero)
-
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_1, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= c_one).select(val + fx.Int32(remote), val)
-
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_2, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(2)).select(val + fx.Int32(remote), val)
-
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_4, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(4)).select(val + fx.Int32(remote), val)
-
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_8, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(8)).select(val + fx.Int32(remote), val)
-
-            if WARP_SIZE > 16:
-                src_lane_16 = (lane & fx.Int32(0x30)) - c_one
-                src_addr_16 = src_lane_16 * c4
-                remote16 = fly_rocdl.ds_bpermute(T.i32, src_addr_16, val)
-                val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
-
-            if WARP_SIZE > 32:
-                src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-                src_addr_32 = src_lane_32 * c4
-                remote32 = fly_rocdl.ds_bpermute(T.i32, src_addr_32, val)
-                val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
+            val = _dpp_intra_wave_prefix_sum(val, lane, WARP_SIZE)
 
             # val now holds intra-wave inclusive prefix sum.
             # Cross-wave accumulation via LDS scratch (ds_bpermute is wave-local).
-            is_last_lane_ps = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(WARP_SIZE - 1))
-            _if_ll_ps = scf.IfOp(is_last_lane_ps)
+            is_last_lane_ps = (lane == fx.Int32(WARP_SIZE - 1))
+            _if_ll_ps = scf.IfOp(is_last_lane_ps.ir_value())
             with _if_then(_if_ll_ps):
                 _lds_store_raw(scatter_mr, val, ArithValue(wave).index_cast(T.index))
             gpu.barrier()
@@ -1170,39 +1233,72 @@ def compile_moe_sorting_prefill(
             my_start = _lds_load_raw(cumsum_mr, ArithValue(my_expert).index_cast(T.index))
             my_end = _lds_load_raw(cumsum_mr, ArithValue(my_expert + c_one).index_cast(T.index))
 
+            local_idx_p23 = tid
+            if has_mask:
+                # EP: Compute mask cumsum for local expert index (register-only DPP scan).
+                p23_mv = _dpp_intra_wave_prefix_sum(p23_mask_val, lane, WARP_SIZE)
+
+                # Cross-wave via scratch_mr
+                is_last_lane_pm = (lane == fx.Int32(WARP_SIZE - 1))
+                _if_ll_pm = scf.IfOp(is_last_lane_pm.ir_value())
+                with _if_then(_if_ll_pm):
+                    _lds_store_raw(scatter_mr, p23_mv, ArithValue(wave).index_cast(T.index))
+                gpu.barrier()
+                cross_pm = c_zero
+                for _w in range_constexpr(K4_NUM_WAVES - 1):
+                    wtp = _lds_load_raw(scatter_mr, ArithValue(fx.Int32(_w)).index_cast(T.index))
+                    cross_pm = (wave > fx.Int32(_w)).select(cross_pm + wtp, cross_pm)
+                p23_mask_inclusive = p23_mv + cross_pm
+                local_idx_p23 = p23_mask_inclusive - p23_mask_val
+            else:
+                local_idx_p23 = tid
+
             # Block 0, thread 0 writes num_valid_ids
-            is_b0 = arith.cmpi(arith.CmpIPredicate.eq, bid, c_zero)
-            is_t0 = arith.cmpi(arith.CmpIPredicate.eq, tid, c_zero)
+            is_b0 = (bid == c_zero)
+            is_t0 = (tid == c_zero)
             is_b0_t0 = is_b0 & is_t0
-            _if_nv = scf.IfOp(is_b0_t0)
+            _if_nv = scf.IfOp(is_b0_t0.ir_value())
             with _if_then(_if_nv):
                 nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
                 buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero)
                 buffer_ops.buffer_store(i32_tokens, nvalid_rsrc, c_one)
 
-            # Step 3: Write sorted_expert_ids for THIS expert (parallel across threads)
+            # Step 3: Write sorted_expert_ids for THIS expert (using local_idx_p23 for EP)
+            # Store local_idx to LDS cumsum[tid], barrier, read cumsum[my_expert]
+            _lds_store_raw(cumsum_mr, local_idx_p23, ArithValue(tid).index_cast(T.index))
+            gpu.barrier()
+            my_local_idx = _lds_load_raw(cumsum_mr, ArithValue(my_expert).index_cast(T.index))
+
             sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
             blk_start = my_start >> fx.Int32(5)   # // 32 (unit_size)
             blk_end = my_end >> fx.Int32(5)       # // 32
             n_blks = blk_end - blk_start
             n_eid_iters = (n_blks + fx.Int32(K4_BLOCK) - c_one) >> fx.Int32(8)  # // 256
-            for _eii in range(arith.index(0), ArithValue(n_eid_iters).index_cast(T.index), arith.index(1)):
+            for _eii in range(fx.Index(0), ArithValue(n_eid_iters).index_cast(T.index), fx.Index(1)):
                 blk_idx = blk_start + fx.Int32(_eii) * fx.Int32(K4_BLOCK) + tid
-                buffer_ops.buffer_store(my_expert, sorted_e_rsrc,
+                buffer_ops.buffer_store(my_local_idx, sorted_e_rsrc,
                                         (blk_idx < blk_end).select(blk_idx, c_oob_idx))
 
             # Step 4: Mesh-based scatter — read uint8 mesh from HBM, extract tokens,
             # DPP prefix sum over counts, cross-wave LDS reduction, scatter stores.
+            p23_bid_enabled = (c_one != c_zero)
+            if has_mask:
+                # EP: skip scatter for masked experts (my_start == my_end, but mesh has data)
+                p23_bid_mask = buffer_ops.buffer_load(mask_rsrc, my_expert, vec_width=1, dtype=T.i32)
+                p23_bid_enabled = (p23_bid_mask != c_zero)
+
             i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
-            n_mesh_iters = (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) >> fx.Int32(8)
+            n_mesh_iters_raw = (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) >> fx.Int32(8)
+            has_work = (my_start != my_end)
+            n_mesh_iters = has_work.select(n_mesh_iters_raw, c_zero)
             mesh_row_i32_base = (my_expert * i32_mesh_stride) >> fx.Int32(2)
 
-            for _si, state in range(arith.index(0), ArithValue(n_mesh_iters).index_cast(T.index),
-                                    arith.index(1), init=[my_start]):
+            for _si, state in range(fx.Index(0), ArithValue(n_mesh_iters).index_cast(T.index),
+                                    fx.Index(1), init=[my_start]):
                 position = state[0]
 
                 word_idx = fx.Int32(_si) * fx.Int32(K4_BLOCK) + tid
-                col_valid = word_idx < i32_words_per_row
+                col_valid = p23_bid_enabled & (word_idx < i32_words_per_row)
                 safe_word_idx = col_valid.select(word_idx, c_zero)
                 word = buffer_ops.buffer_load(ws_rsrc, mesh_row_i32_base + safe_word_idx,
                                               vec_width=1, dtype=T.i32)
@@ -1222,43 +1318,12 @@ def compile_moe_sorting_prefill(
                 my_cnt = (h0.select(c_one, c_zero) + h1.select(c_one, c_zero)
                           + h2.select(c_one, c_zero) + h3.select(c_one, c_zero))
 
-                # DPP inclusive prefix sum over my_cnt within each wave
-                cnt_raw = _unwrap_raw(my_cnt)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, cnt_raw,
-                                              DPP_ROW_SHR_1, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                my_cnt = (lane >= c_one).select(my_cnt + fx.Int32(remote), my_cnt)
-
-                cnt_raw = _unwrap_raw(my_cnt)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, cnt_raw,
-                                              DPP_ROW_SHR_2, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                my_cnt = (lane >= fx.Int32(2)).select(my_cnt + fx.Int32(remote), my_cnt)
-
-                cnt_raw = _unwrap_raw(my_cnt)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, cnt_raw,
-                                              DPP_ROW_SHR_4, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                my_cnt = (lane >= fx.Int32(4)).select(my_cnt + fx.Int32(remote), my_cnt)
-
-                cnt_raw = _unwrap_raw(my_cnt)
-                remote = fly_rocdl.update_dpp(T.i32, zero_raw, cnt_raw,
-                                              DPP_ROW_SHR_8, DPP_ROW_MASK, DPP_BANK_MASK, True)
-                my_cnt = (lane >= fx.Int32(8)).select(my_cnt + fx.Int32(remote), my_cnt)
-
-                if WARP_SIZE > 16:
-                    src_lane_16 = (lane & fx.Int32(0x30)) - c_one
-                    src_addr_16 = src_lane_16 * c4
-                    remote16 = fly_rocdl.ds_bpermute(T.i32, src_addr_16, my_cnt)
-                    my_cnt = (lane >= fx.Int32(16)).select(my_cnt + fx.Int32(remote16), my_cnt)
-
-                if WARP_SIZE > 32:
-                    src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-                    src_addr_32 = src_lane_32 * c4
-                    remote32 = fly_rocdl.ds_bpermute(T.i32, src_addr_32, my_cnt)
-                    my_cnt = (lane >= fx.Int32(32)).select(my_cnt + fx.Int32(remote32), my_cnt)
+                my_cnt = _dpp_intra_wave_prefix_sum(my_cnt, lane, WARP_SIZE)
 
                 # my_cnt is now intra-wave inclusive prefix sum of per-thread token counts.
                 # Cross-wave reduction via LDS scratch.
-                is_last_lane_sc = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(WARP_SIZE - 1))
-                _if_ll_sc = scf.IfOp(is_last_lane_sc)
+                is_last_lane_sc = (lane == fx.Int32(WARP_SIZE - 1))
+                _if_ll_sc = scf.IfOp(is_last_lane_sc.ir_value())
                 with _if_then(_if_ll_sc):
                     _lds_store_raw(scatter_mr, my_cnt, ArithValue(wave).index_cast(T.index))
                 gpu.barrier()
@@ -1277,50 +1342,51 @@ def compile_moe_sorting_prefill(
                                    + h2.select(c_one, c_zero) + h3.select(c_one, c_zero))
                 my_exclusive = my_cnt - my_thread_count + wave_offset
 
-                # Scatter each valid token using predicated stores (OOB drops silently)
+                # Scatter: compute all addresses, batch-load weights, then batch-store.
                 scatter_base = position + my_exclusive
 
-                # Token 0 (byte 0)
+                # Compute packed IDs and output slots for all 4 tokens
                 token_id_0 = base_col
                 topk_slot_0 = h0.select(x0 - c_one, c_zero)
                 pid_0 = (topk_slot_0 << fx.Int32(24)) | token_id_0
                 safe_slot_0 = h0.select(scatter_base, c_oob_idx)
-                buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
-                w_addr_0 = h0.select(token_id_0 * c_topk + topk_slot_0, c_zero)
-                w_val_0 = buffer_ops.buffer_load(weights_rsrc, w_addr_0, vec_width=1, dtype=T.i32)
-                buffer_ops.buffer_store(w_val_0, sorted_w_rsrc, safe_slot_0)
 
-                # Token 1 (byte 1)
                 off1 = scatter_base + h0.select(c_one, c_zero)
                 token_id_1 = base_col + c_one
                 topk_slot_1 = h1.select(x1 - c_one, c_zero)
                 pid_1 = (topk_slot_1 << fx.Int32(24)) | token_id_1
                 safe_slot_1 = h1.select(off1, c_oob_idx)
-                buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
-                w_addr_1 = h1.select(token_id_1 * c_topk + topk_slot_1, c_zero)
-                w_val_1 = buffer_ops.buffer_load(weights_rsrc, w_addr_1, vec_width=1, dtype=T.i32)
-                buffer_ops.buffer_store(w_val_1, sorted_w_rsrc, safe_slot_1)
 
-                # Token 2 (byte 2)
                 off2 = off1 + h1.select(c_one, c_zero)
                 token_id_2 = base_col + fx.Int32(2)
                 topk_slot_2 = h2.select(x2 - c_one, c_zero)
                 pid_2 = (topk_slot_2 << fx.Int32(24)) | token_id_2
                 safe_slot_2 = h2.select(off2, c_oob_idx)
-                buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
-                w_addr_2 = h2.select(token_id_2 * c_topk + topk_slot_2, c_zero)
-                w_val_2 = buffer_ops.buffer_load(weights_rsrc, w_addr_2, vec_width=1, dtype=T.i32)
-                buffer_ops.buffer_store(w_val_2, sorted_w_rsrc, safe_slot_2)
 
-                # Token 3 (byte 3)
                 off3 = off2 + h2.select(c_one, c_zero)
                 token_id_3 = base_col + fx.Int32(3)
                 topk_slot_3 = h3.select(x3 - c_one, c_zero)
                 pid_3 = (topk_slot_3 << fx.Int32(24)) | token_id_3
                 safe_slot_3 = h3.select(off3, c_oob_idx)
-                buffer_ops.buffer_store(pid_3, sorted_ids_rsrc, safe_slot_3)
+
+                # Batch-issue all 4 weight loads (increases load-use distance)
+                w_addr_0 = h0.select(token_id_0 * c_topk + topk_slot_0, c_zero)
+                w_addr_1 = h1.select(token_id_1 * c_topk + topk_slot_1, c_zero)
+                w_addr_2 = h2.select(token_id_2 * c_topk + topk_slot_2, c_zero)
                 w_addr_3 = h3.select(token_id_3 * c_topk + topk_slot_3, c_zero)
+                w_val_0 = buffer_ops.buffer_load(weights_rsrc, w_addr_0, vec_width=1, dtype=T.i32)
+                w_val_1 = buffer_ops.buffer_load(weights_rsrc, w_addr_1, vec_width=1, dtype=T.i32)
+                w_val_2 = buffer_ops.buffer_load(weights_rsrc, w_addr_2, vec_width=1, dtype=T.i32)
                 w_val_3 = buffer_ops.buffer_load(weights_rsrc, w_addr_3, vec_width=1, dtype=T.i32)
+
+                # Batch-store: all packed IDs, then all weights
+                buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
+                buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
+                buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
+                buffer_ops.buffer_store(pid_3, sorted_ids_rsrc, safe_slot_3)
+                buffer_ops.buffer_store(w_val_0, sorted_w_rsrc, safe_slot_0)
+                buffer_ops.buffer_store(w_val_1, sorted_w_rsrc, safe_slot_1)
+                buffer_ops.buffer_store(w_val_2, sorted_w_rsrc, safe_slot_2)
                 buffer_ops.buffer_store(w_val_3, sorted_w_rsrc, safe_slot_3)
 
                 pos_next = position + batch_total
@@ -1331,7 +1397,7 @@ def compile_moe_sorting_prefill(
             sentinel_val = c_sentinel | i32_tokens
             pad_count = my_end - scatter_end_pos_t0
             pad_niters = (pad_count + fx.Int32(K4_BLOCK) - c_one) >> fx.Int32(8)  # // 256
-            for _pi in range(arith.index(0), ArithValue(pad_niters).index_cast(T.index), arith.index(1)):
+            for _pi in range(fx.Index(0), ArithValue(pad_niters).index_cast(T.index), fx.Index(1)):
                 pad_slot = scatter_end_pos_t0 + fx.Int32(_pi) * fx.Int32(K4_BLOCK) + tid
                 pad_valid = pad_slot < my_end
                 buffer_ops.buffer_store(sentinel_val, sorted_ids_rsrc,
@@ -1348,6 +1414,7 @@ def compile_moe_sorting_prefill(
         sorted_expert_ids: fx.Tensor,
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
@@ -1364,11 +1431,96 @@ def compile_moe_sorting_prefill(
             workspace, topk_weights_tensor,
             sorted_token_ids, sorted_weights_out, sorted_expert_ids,
             num_valid_ids_out, moe_buf,
+            expert_mask_tensor,
             i32_tokens, i32_mesh_stride, i32_mesh_size, i32_moe_buf_elems,
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
 
-    return launch_clear_ws, launch_p0, launch_p1, launch_p23, launch_p0v2
+    @flyc.jit
+    def launch_p0v2_p23(
+        topk_ids: fx.Tensor,
+        workspace: fx.Tensor,
+        topk_weights_tensor: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights_out: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids_out: fx.Tensor,
+        moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_mesh_stride: fx.Int32,
+        i32_mesh_size: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+        n_grid_p23: fx.Constexpr[int],
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        p0v2_allocator.finalized = False
+        k4_allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            p0v2_allocator.finalize()
+            k4_allocator.finalize()
+
+        l1 = p0v2_kernel(topk_ids, workspace, expert_mask_tensor, i32_tokens, i32_mesh_stride, i32_mesh_size)
+        l1.launch(grid=(E, 1, 1), block=(P0V2_BLOCK, 1, 1), stream=stream)
+
+        l2 = p23_kernel(
+            workspace, topk_weights_tensor,
+            sorted_token_ids, sorted_weights_out, sorted_expert_ids,
+            num_valid_ids_out, moe_buf,
+            expert_mask_tensor,
+            i32_tokens, i32_mesh_stride, i32_mesh_size, i32_moe_buf_elems,
+        )
+        l2.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    @flyc.jit
+    def launch_4k_fused(
+        topk_ids: fx.Tensor,
+        workspace: fx.Tensor,
+        topk_weights_tensor: fx.Tensor,
+        sorted_token_ids: fx.Tensor,
+        sorted_weights_out: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
+        num_valid_ids_out: fx.Tensor,
+        moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_mesh_stride: fx.Int32,
+        i32_mesh_size: fx.Int32,
+        i32_moe_buf_elems: fx.Int32,
+        i32_ws_total: fx.Int32,
+        i32_p0_niters: fx.Int32,
+        n_grid_k1: fx.Constexpr[int],
+        n_grid_k2: fx.Constexpr[int],
+        n_grid_p23: fx.Constexpr[int],
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        k3_allocator.finalized = False
+        k4_allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            k3_allocator.finalize()
+            k4_allocator.finalize()
+
+        l1 = clear_workspace_kernel(workspace, i32_ws_total)
+        l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
+
+        l2 = p0_scatter_kernel(topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_p0_niters)
+        l2.launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
+
+        l3 = p1_count_kernel(workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size)
+        l3.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
+
+        l4 = p23_kernel(
+            workspace, topk_weights_tensor,
+            sorted_token_ids, sorted_weights_out, sorted_expert_ids,
+            num_valid_ids_out, moe_buf,
+            expert_mask_tensor,
+            i32_tokens, i32_mesh_stride, i32_mesh_size, i32_moe_buf_elems,
+        )
+        l4.launch(grid=(n_grid_p23, 1, 1), block=(K4_BLOCK, 1, 1), stream=stream)
+
+    return launch_clear_ws, launch_p0, launch_p1, launch_p23, launch_p0v2, launch_p0v2_p23, launch_4k_fused
 
 
 # ---------------------------------------------------------------------------
@@ -1380,7 +1532,7 @@ _meshless_cf_cache = {}  # (num_experts, topk, unit_size, n_grid) -> CompiledFun
 
 
 @functools.lru_cache(maxsize=256)
-def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
+def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE, has_mask=False):
     """Compile the single-kernel meshless MoE sorting kernel.
 
     Replaces P0v2 + K4 for small T (<=512) with a single kernel launch.
@@ -1398,7 +1550,6 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
     LDS: cumsum[E+1] i32 + 1 i32 atomic counter
     """
     arch = get_hip_arch()
-    WARP_SIZE = get_warp_size(arch)
     E = num_experts
     ML_BLOCK = 256  # Must equal E for 1:1 thread-expert mapping
     ML_NUM_WAVES = ML_BLOCK // WARP_SIZE
@@ -1406,13 +1557,6 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
     _ml_topk_is_po2 = (topk & (topk - 1)) == 0 and topk > 0
     _ml_topk_log2 = topk.bit_length() - 1 if _ml_topk_is_po2 else 0
 
-    # DPP constants (same as K4)
-    DPP_ROW_SHR_1 = 0x111
-    DPP_ROW_SHR_2 = 0x112
-    DPP_ROW_SHR_4 = 0x114
-    DPP_ROW_SHR_8 = 0x118
-    DPP_ROW_MASK = 0xF
-    DPP_BANK_MASK = 0xF
 
     # LDS: cumsum[E+1] + scratch[ML_NUM_WAVES] (cross-wave) + atomic counter (1 i32)
     ml_allocator = SmemAllocator(None, arch=arch)
@@ -1432,11 +1576,12 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
         sorted_expert_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
     ):
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
+        bid = gpu.block_idx.x
+        tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
         c_zero = fx.Int32(0)
@@ -1452,34 +1597,38 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
         weights_rsrc = buffer_ops.create_buffer_resource(topk_weights_tensor, max_size=True)
         sorted_ids_rsrc = buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
         sorted_w_rsrc = buffer_ops.create_buffer_resource(sorted_weights_out, max_size=True)
+        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
         base_ptr = ml_allocator.get_base()
         cumsum_mr = SmemPtr(base_ptr, ml_cumsum_offset, T.i32, shape=(E + 1,)).get()
         scratch_mr = SmemPtr(base_ptr, ml_scratch_offset, T.i32, shape=(ML_NUM_WAVES,)).get()
         atomic_mr = SmemPtr(base_ptr, ml_atomic_offset, T.i32, shape=(1,)).get()
 
-        is_sort_block = arith.cmpi(arith.CmpIPredicate.slt, bid, c_E)
-        is_zero_block = arith.cmpi(arith.CmpIPredicate.sge, bid, c_E)
+        is_sort_block = (bid < c_E)
+        is_zero_block = (bid >= c_E)
 
         # ================ MOE_BUF ZEROING (blocks >= E) ==================
-        _if_zero = scf.IfOp(is_zero_block)
+        _if_zero = scf.IfOp(is_zero_block.ir_value())
         with _if_then(_if_zero):
             moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
             zero_base_bid = bid - c_E
-            zero_gid = zero_base_bid * fx.Int32(ML_BLOCK) + tid
-            num_zero_blocks = fx.grid_dim.x - c_E
-            zero_stride = num_zero_blocks * fx.Int32(ML_BLOCK)
-            zero_niters = (i32_moe_buf_elems + zero_stride - c_one) // zero_stride
-            _zs = arith.index(0)
+            zero_gid_v4 = zero_base_bid * fx.Int32(ML_BLOCK) + tid
+            num_zero_blocks = gpu.grid_dim.x - c_E
+            zero_stride_v4 = num_zero_blocks * fx.Int32(ML_BLOCK)
+            i32_moe_buf_v4 = i32_moe_buf_elems >> fx.Int32(2)
+            zero_niters = (i32_moe_buf_v4 + zero_stride_v4 - c_one) // zero_stride_v4
+            _zs = fx.Index(0)
             _ze = ArithValue(zero_niters).index_cast(T.index)
-            _z1 = arith.index(1)
+            _z1 = fx.Index(1)
+            c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
             for _z in range(_zs, _ze, _z1):
-                z_idx = zero_gid + fx.Int32(_z) * zero_stride
-                z_valid = z_idx < i32_moe_buf_elems
-                buffer_ops.buffer_store(c_zero, moe_buf_rsrc, z_valid.select(z_idx, c_zero))
+                z_idx_v4 = zero_gid_v4 + fx.Int32(_z) * zero_stride_v4
+                z_valid = z_idx_v4 < i32_moe_buf_v4
+                z_elem = z_valid.select(z_idx_v4 * c4, c_oob_idx)
+                buffer_ops.buffer_store(c_zero_v4, moe_buf_rsrc, z_elem)
 
         # ================ SORTING (blocks 0..E-1) ========================
-        _if_sort = scf.IfOp(is_sort_block)
+        _if_sort = scf.IfOp(is_sort_block.ir_value())
         with _if_then(_if_sort):
             my_expert = bid
 
@@ -1498,8 +1647,8 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             # Cooperative scan: each thread processes its stride of assignments
             one_raw = _unwrap_raw(c_one)
             n_count_iters = (total_assignments + fx.Int32(ML_BLOCK - 1)) >> fx.Int32(8)
-            for _ci in range(arith.index(0), ArithValue(n_count_iters).index_cast(T.index),
-                             arith.index(1)):
+            for _ci in range(fx.Index(0), ArithValue(n_count_iters).index_cast(T.index),
+                             fx.Index(1)):
                 flat = fx.Int32(_ci) * fx.Int32(ML_BLOCK) + tid
                 valid = flat < total_assignments
                 safe_flat = valid.select(flat, c_zero)
@@ -1507,7 +1656,7 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
                 # AtomicAdd to histogram[eid] for valid assignments
                 safe_eid = valid.select(eid, c_zero)
                 eid_ix = ArithValue(safe_eid).index_cast(T.index)
-                valid_i1 = arith.cmpi(arith.CmpIPredicate.ne, valid.select(c_one, c_zero), c_zero)
+                valid_i1 = (valid.select(c_one, c_zero) != c_zero)
                 _if_valid = scf.IfOp(valid_i1)
                 with _if_then(_if_valid):
                     memref_ops.atomic_rmw(arith.AtomicRMWKind.addi, one_raw,
@@ -1519,6 +1668,15 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
                 _lds_load_raw(cumsum_mr, ArithValue(tid).index_cast(T.index)),
                 c_zero)
 
+            my_mask = c_one
+            if has_mask:
+                # EP: zero count for masked experts.
+                my_mask = buffer_ops.buffer_load(
+                    mask_rsrc, tid_valid_for_hist.select(tid, c_zero),
+                    vec_width=1, dtype=T.i32)
+                ep_zero_ml = tid_valid_for_hist & (my_mask == c_zero)
+                my_count = ep_zero_ml.select(c_zero, my_count)
+
             # ---- Phase 2: Prefix sum (P0v2 pattern — all threads, cross-wave via scratch) ----
             # Write padded count to LDS cumsum[tid+1]; thread 0 writes cumsum[0]=0
             # Guard for E < ML_BLOCK: only threads tid < E write to cumsum
@@ -1528,8 +1686,8 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             safe_cs_wr = tid_valid_for_ps.select(tid + c_one, c_zero)
             _lds_store_raw(cumsum_mr, tid_valid_for_ps.select(padded, c_zero),
                            ArithValue(safe_cs_wr).index_cast(T.index))
-            is_t0_cs = arith.cmpi(arith.CmpIPredicate.eq, tid, c_zero)
-            _if_init_cs = scf.IfOp(is_t0_cs)
+            is_t0_cs = (tid == c_zero)
+            _if_init_cs = scf.IfOp(is_t0_cs.ir_value())
             with _if_then(_if_init_cs):
                 _lds_store_raw(cumsum_mr, c_zero, ArithValue(c_zero).index_cast(T.index))
             gpu.barrier()
@@ -1539,47 +1697,11 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             safe_cs_rd = tid_valid_for_ps.select(tid + c_one, c_zero)
             val = _lds_load_raw(cumsum_mr, ArithValue(safe_cs_rd).index_cast(T.index))
             val = tid_valid_for_ps.select(val, c_zero)
-            val_raw = _unwrap_raw(val)
-            zero_raw = _unwrap_raw(c_zero)
-
-            # DPP row_shr 1
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_1, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= c_one).select(val + fx.Int32(remote), val)
-
-            # DPP row_shr 2
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_2, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(2)).select(val + fx.Int32(remote), val)
-
-            # DPP row_shr 4
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_4, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(4)).select(val + fx.Int32(remote), val)
-
-            # DPP row_shr 8
-            val_raw = _unwrap_raw(val)
-            remote = fly_rocdl.update_dpp(T.i32, zero_raw, val_raw,
-                                          DPP_ROW_SHR_8, DPP_ROW_MASK, DPP_BANK_MASK, True)
-            val = (lane >= fx.Int32(8)).select(val + fx.Int32(remote), val)
-
-            if WARP_SIZE > 16:
-                src_lane_16 = (lane & fx.Int32(0x30)) - c_one
-                src_addr_16 = src_lane_16 * c4
-                remote16 = fly_rocdl.ds_bpermute(T.i32, src_addr_16, val)
-                val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
-
-            if WARP_SIZE > 32:
-                src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-                src_addr_32 = src_lane_32 * c4
-                remote32 = fly_rocdl.ds_bpermute(T.i32, src_addr_32, val)
-                val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
+            val = _dpp_intra_wave_prefix_sum(val, lane, WARP_SIZE)
 
             # Cross-wave accumulation via LDS scratch
-            is_last_lane_ps = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(WARP_SIZE - 1))
-            _if_ll_ps = scf.IfOp(is_last_lane_ps)
+            is_last_lane_ps = (lane == fx.Int32(WARP_SIZE - 1))
+            _if_ll_ps = scf.IfOp(is_last_lane_ps.ir_value())
             with _if_then(_if_ll_ps):
                 _lds_store_raw(scratch_mr, val, ArithValue(wave).index_cast(T.index))
             gpu.barrier()
@@ -1601,30 +1723,64 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             my_start = _lds_load_raw(cumsum_mr, ArithValue(my_expert).index_cast(T.index))
             my_end = _lds_load_raw(cumsum_mr, ArithValue(my_expert + c_one).index_cast(T.index))
 
+            my_local_idx_ml = my_expert
+            if has_mask:
+                # EP: Compute mask cumsum for local expert index (register-only DPP scan).
+                mask_val_ml = _dpp_intra_wave_prefix_sum(
+                    tid_valid_for_ps.select(my_mask, c_zero), lane, WARP_SIZE)
+
+                # Cross-wave: reuse scratch_mr
+                is_last_lane_ml = (lane == fx.Int32(WARP_SIZE - 1))
+                _if_ll_ml = scf.IfOp(is_last_lane_ml.ir_value())
+                with _if_then(_if_ll_ml):
+                    _lds_store_raw(scratch_mr, mask_val_ml, ArithValue(wave).index_cast(T.index))
+                gpu.barrier()
+                cross_ml = c_zero
+                for _w in range_constexpr(ML_NUM_WAVES - 1):
+                    wt = _lds_load_raw(scratch_mr, ArithValue(fx.Int32(_w)).index_cast(T.index))
+                    cross_ml = (wave > fx.Int32(_w)).select(cross_ml + wt, cross_ml)
+                mask_inclusive = mask_val_ml + cross_ml
+                my_mask_val = tid_valid_for_ps.select(my_mask, c_zero)
+                local_idx_ml = mask_inclusive - my_mask_val
+
+                # Store local_idx to LDS and broadcast to my_expert
+                _lds_store_raw(cumsum_mr, tid_valid_for_ps.select(local_idx_ml, c_zero),
+                               ArithValue(tid_valid_for_ps.select(tid, c_zero)).index_cast(T.index))
+                gpu.barrier()
+                my_local_idx_ml = _lds_load_raw(cumsum_mr, ArithValue(my_expert).index_cast(T.index))
+            else:
+                my_local_idx_ml = my_expert
+
             # num_valid_ids (block 0 thread 0)
-            is_b0 = arith.cmpi(arith.CmpIPredicate.eq, bid, c_zero)
-            is_t0 = arith.cmpi(arith.CmpIPredicate.eq, tid, c_zero)
+            is_b0 = (bid == c_zero)
+            is_t0 = (tid == c_zero)
             is_b0_t0 = is_b0 & is_t0
-            _if_nv = scf.IfOp(is_b0_t0)
+            _if_nv = scf.IfOp(is_b0_t0.ir_value())
             with _if_then(_if_nv):
                 nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
                 buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero)
                 buffer_ops.buffer_store(i32_tokens, nvalid_rsrc, c_one)
 
-            # ---- Phase 3: Write sorted_expert_ids ----
+            # ---- Phase 3: Write sorted_expert_ids (using my_local_idx_ml for EP) ----
             sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
             blk_start = my_start >> fx.Int32(5)
             blk_end = my_end >> fx.Int32(5)
             n_blks = blk_end - blk_start
             n_eid_iters = (n_blks + fx.Int32(ML_BLOCK) - c_one) >> fx.Int32(8)
-            for _eii in range(arith.index(0), ArithValue(n_eid_iters).index_cast(T.index), arith.index(1)):
+            for _eii in range(fx.Index(0), ArithValue(n_eid_iters).index_cast(T.index), fx.Index(1)):
                 blk_idx = blk_start + fx.Int32(_eii) * fx.Int32(ML_BLOCK) + tid
-                buffer_ops.buffer_store(my_expert, sorted_e_rsrc,
+                buffer_ops.buffer_store(my_local_idx_ml, sorted_e_rsrc,
                                         (blk_idx < blk_end).select(blk_idx, c_oob_idx))
 
             # ---- Phase 4: Atomic scatter (no mesh — re-read topk_ids) ----
+            ml_bid_enabled = (c_one != c_zero)
+            if has_mask:
+                # EP: load mask for this block's expert to skip scatter if masked.
+                ml_bid_mask = buffer_ops.buffer_load(mask_rsrc, my_expert, vec_width=1, dtype=T.i32)
+                ml_bid_enabled = (ml_bid_mask != c_zero)
+
             # Initialize LDS counter to 0
-            _if_t0 = scf.IfOp(is_t0)
+            _if_t0 = scf.IfOp(is_t0.ir_value())
             with _if_then(_if_t0):
                 _lds_store_raw(atomic_mr, c_zero, ArithValue(c_zero).index_cast(T.index))
             gpu.barrier()
@@ -1633,8 +1789,8 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             one_raw = _unwrap_raw(c_one)
 
             n_scatter_iters = (total_assignments + fx.Int32(ML_BLOCK - 1)) >> fx.Int32(8)
-            for _si in range(arith.index(0), ArithValue(n_scatter_iters).index_cast(T.index),
-                             arith.index(1)):
+            for _si in range(fx.Index(0), ArithValue(n_scatter_iters).index_cast(T.index),
+                             fx.Index(1)):
                 flat = fx.Int32(_si) * fx.Int32(ML_BLOCK) + tid
                 valid_s = flat < total_assignments
                 safe_flat_s = valid_s.select(flat, c_zero)
@@ -1648,13 +1804,13 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
                     topk_slot = safe_flat_s - token_id * c_topk
                     w_flat = token_id * c_topk + topk_slot
                 expert_id = buffer_ops.buffer_load(topk_rsrc, safe_flat_s, vec_width=1, dtype=T.i32)
-                is_mine = valid_s & (expert_id == my_expert)
+                is_mine = valid_s & ml_bid_enabled & (expert_id == my_expert)
                 # Pre-compute values outside IfOp
                 pid = (topk_slot << fx.Int32(24)) | token_id
                 w_val = buffer_ops.buffer_load(
                     weights_rsrc, valid_s.select(w_flat, c_zero), vec_width=1, dtype=T.i32)
                 # Conditional scatter via scf.IfOp
-                is_mine_i1 = arith.cmpi(arith.CmpIPredicate.ne, is_mine.select(c_one, c_zero), c_zero)
+                is_mine_i1 = (is_mine.select(c_one, c_zero) != c_zero)
                 _if_mine = scf.IfOp(is_mine_i1)
                 with _if_then(_if_mine):
                     pos = fx.Int32(memref_ops.atomic_rmw(
@@ -1671,7 +1827,7 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             sentinel_val = c_sentinel | i32_tokens
             pad_count = my_end - scatter_end_pos
             pad_niters = (pad_count + fx.Int32(ML_BLOCK) - c_one) >> fx.Int32(8)
-            for _pi in range(arith.index(0), ArithValue(pad_niters).index_cast(T.index), arith.index(1)):
+            for _pi in range(fx.Index(0), ArithValue(pad_niters).index_cast(T.index), fx.Index(1)):
                 pad_slot = scatter_end_pos + fx.Int32(_pi) * fx.Int32(ML_BLOCK) + tid
                 pad_valid = pad_slot < my_end
                 buffer_ops.buffer_store(sentinel_val, sorted_ids_rsrc,
@@ -1688,6 +1844,7 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
         sorted_expert_ids: fx.Tensor,
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
+        expert_mask_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid: fx.Constexpr[int],
@@ -1702,6 +1859,7 @@ def compile_meshless_sort(*, num_experts, topk, unit_size=UNIT_SIZE):
             topk_ids_tensor, topk_weights_tensor,
             sorted_token_ids, sorted_weights_out, sorted_expert_ids,
             num_valid_ids_out, moe_buf,
+            expert_mask_tensor,
             i32_tokens, i32_moe_buf_elems,
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(ML_BLOCK, 1, 1), stream=stream)
@@ -1737,91 +1895,89 @@ def _compute_sub_tokens(num_experts, arch=None):
     if r < (cumsum_bufs + sub_unroll):
         return 0  # LDS too small — always use prefill
     r_for_sub = ((r - cumsum_bufs) // sub_unroll) * sub_unroll
-    # Cap at 24: beyond this, the prefill path (256 parallel blocks) outperforms
-    # the decode path (1 block) even on GPUs with larger LDS (gfx950: 160KB).
-    return min(r_for_sub, 24)
+    return r_for_sub
 
 
 def moe_sorting_flydsl(
     topk_ids,
     topk_weights,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_buf,
     num_experts,
-    model_dim=4096,
-    moebuf_dtype=None,
-    topk=None,
     unit_size=UNIT_SIZE,
-    max_tokens=None,
-    sorted_ids=None,
-    sorted_weights=None,
-    sorted_expert_ids=None,
-    num_valid_ids=None,
-    moe_buf=None,
+    expert_mask=None,
+    num_local_tokens=None,
+    dispatch_policy=0,
 ):
     """MoE sorting using FlyDSL kernel (decode + prefill paths).
 
-    API matches aiter.fused_moe.moe_sorting for drop-in replacement.
-    Pre-allocated output tensors can be passed to avoid per-call allocation
-    overhead (~2 us savings in graph mode).
+    API matches aiter.moe_sorting_fwd for drop-in replacement:
+        moe_sorting_flydsl(topk_ids, topk_weights,
+                           sorted_ids, sorted_weights, sorted_expert_ids,
+                           num_valid_ids, moe_buf,
+                           num_experts, unit_size, expert_mask,
+                           num_local_tokens, dispatch_policy)
+
+    All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
+    num_valid_ids, moe_buf) must be pre-allocated by the caller.
 
     Returns
     -------
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
     """
-    import torch
-
-    if moebuf_dtype is None:
-        moebuf_dtype = torch.bfloat16
-    if topk is None:
-        topk = topk_ids.shape[1]
-    M = topk_ids.shape[0]
+    topk = topk_ids.shape[1]
+    if num_local_tokens is not None:
+        M = num_local_tokens.item() if isinstance(num_local_tokens, torch.Tensor) else int(num_local_tokens)
+    else:
+        M = topk_ids.shape[0]
 
     sub_tokens = _compute_sub_tokens(num_experts)
 
     max_num_tokens_padded = M * topk + num_experts * unit_size - topk
-    max_num_m_blocks = (max_num_tokens_padded + unit_size - 1) // unit_size
 
     device = topk_ids.device
-    if sorted_ids is None:
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=torch.int32, device=device)
-    if sorted_weights is None:
-        sorted_weights = torch.empty(max_num_tokens_padded, dtype=torch.float32, device=device)
-    if sorted_expert_ids is None:
-        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=torch.int32, device=device)
-    if num_valid_ids is None:
-        num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-    if moe_buf is None:
-        moe_buf = torch.empty(M * model_dim * 2 // 4, dtype=torch.int32, device=device)
+    moe_buf_i32 = moe_buf.view(torch.int32)
+    moe_buf_elems = moe_buf_i32.numel()
 
-    moe_buf_elems = moe_buf.shape[0]
+    # EP: prepare mask tensor and flag.
+    has_mask = expert_mask is not None
+    if not has_mask:
+        mask_tensor = _dummy_mask_cache.get(device)
+        if mask_tensor is None:
+            mask_tensor = torch.ones(1, dtype=torch.int32, device=device)
+            _dummy_mask_cache[device] = mask_tensor
+    else:
+        mask_tensor = expert_mask
 
-    # Meshless threshold: single kernel for T <= 512 (when T > sub_tokens).
-    # Avoids HBM mesh and saves one kernel launch vs P0v2+K4.
     MESHLESS_MAX_T = 512
+    DECODE_MAX_T = 16
 
-    if M <= sub_tokens:
-        # Decode path: single kernel
-        if max_tokens is None:
-            max_tokens = max(M, 8)
-            max_tokens = ((max_tokens + 7) // 8) * 8
-        assert M <= max_tokens, f"T={M} exceeds max_tokens={max_tokens}"
+    if M <= min(sub_tokens, DECODE_MAX_T):
+        max_tokens = max(M, 8)
+        max_tokens = ((max_tokens + 7) // 8) * 8
 
-        n_zero_blocks = (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE
+        target_occupancy = 2
+        num_cu = torch.cuda.get_device_properties(topk_ids.device).multi_processor_count
+        n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         n_grid_blocks = 1 + n_zero_blocks
 
         launch_moe_sorting_decode_path(
             topk_ids, topk_weights,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            moe_buf, M, moe_buf_elems, n_grid_blocks,
+            moe_buf_i32, mask_tensor, M, moe_buf_elems, n_grid_blocks,
             num_experts=num_experts, topk=topk,
-            max_tokens=max_tokens, unit_size=unit_size,
+            max_tokens=max_tokens, unit_size=unit_size, has_mask=has_mask,
         )
     elif M <= MESHLESS_MAX_T and num_experts <= 256:
         # Meshless path: single kernel, no HBM workspace
         launch_meshless_sort_path(
             topk_ids, topk_weights,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            moe_buf, M, moe_buf_elems,
-            num_experts=num_experts, topk=topk, unit_size=unit_size,
+            moe_buf_i32, mask_tensor, M, moe_buf_elems,
+            num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask,
         )
     else:
         # Prefill path: multiple kernels via HBM workspace
@@ -1835,21 +1991,20 @@ def moe_sorting_flydsl(
         launch_moe_sorting_prefill_path(
             topk_ids, topk_weights,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            moe_buf, workspace,
+            moe_buf_i32, workspace, mask_tensor,
             M, moe_buf_elems, mesh_stride, ws_mesh_i32, ws_total,
-            num_experts=num_experts, topk=topk, unit_size=unit_size,
+            num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask,
         )
 
-    moe_buf_out = moe_buf.view(moebuf_dtype).reshape(M, model_dim)
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf_out
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
 def launch_moe_sorting_decode_path(
     topk_ids, topk_weights,
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    moe_buf_i32, i32_tokens, i32_moe_buf_elems, n_grid_blocks,
+    moe_buf_i32, expert_mask, i32_tokens, i32_moe_buf_elems, n_grid_blocks,
     *,
-    num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE,
+    num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE, has_mask=False,
 ):
     """Low-level launcher for decode path: single kernel.
 
@@ -1857,46 +2012,41 @@ def launch_moe_sorting_decode_path(
     Uses AOT-compiled dispatch after the first call to bypass the ~70 us
     JIT overhead (inspect.Signature.bind + cache key + dict lookup).
     """
-    import torch
 
-    cache_key = (num_experts, topk, max_tokens, unit_size, n_grid_blocks)
+    cache_key = (num_experts, topk, max_tokens, unit_size, n_grid_blocks, has_mask)
     cf = _decode_cf_cache.get(cache_key)
     if cf is not None:
-        # Fast path: ~5 us (update ctypes slots + invoke C function pointer)
         stream = torch.cuda.current_stream()
         cf(topk_ids, topk_weights,
            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-           moe_buf_i32,
+           moe_buf_i32, expert_mask,
            i32_tokens, i32_moe_buf_elems,
            n_grid_blocks,
            fx.Stream(stream))
         return
 
-    # Cold path: first call triggers JIT compilation
     launch_fn = compile_moe_sorting_decode(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
         unit_size=unit_size,
+        has_mask=has_mask,
     )
     stream = torch.cuda.current_stream()
     launch_fn(
         topk_ids, topk_weights,
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-        moe_buf_i32,
+        moe_buf_i32, expert_mask,
         i32_tokens, i32_moe_buf_elems,
         n_grid_blocks,
         stream=stream,
     )
 
-    # Build and cache the CompiledFunction for subsequent fast dispatch.
-    # flyc.compile() re-invokes launch_fn (hits the CallState fast path)
-    # and returns a CompiledFunction wrapping the pre-built CallState.
     cf = flyc.compile(
         launch_fn,
         topk_ids, topk_weights,
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-        moe_buf_i32,
+        moe_buf_i32, expert_mask,
         i32_tokens, i32_moe_buf_elems,
         n_grid_blocks,
         fx.Stream(stream),
@@ -1907,34 +2057,29 @@ def launch_moe_sorting_decode_path(
 def launch_meshless_sort_path(
     topk_ids, topk_weights,
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    moe_buf_i32, i32_tokens, i32_moe_buf_elems,
+    moe_buf_i32, expert_mask, i32_tokens, i32_moe_buf_elems,
     *,
-    num_experts, topk, unit_size=UNIT_SIZE,
+    num_experts, topk, unit_size=UNIT_SIZE, has_mask=False,
 ):
     """Low-level launcher for meshless sort path: single kernel, no HBM workspace.
 
     For T <= 512: replaces P0v2+K4 with a single kernel.
     Uses AOT-compiled dispatch after the first call.
     """
-    import torch
 
-    try:
-        from aiter.jit.utils.chip_info import get_cu_num
-        NUM_CU = get_cu_num()
-    except ImportError:
-        NUM_CU = 304  # MI300X fallback
+    num_cu = torch.cuda.get_device_properties(topk_ids.device).multi_processor_count
 
-    ML_OCCUPANCY = 2
-    n_zero_blocks = min((i32_moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, NUM_CU * ML_OCCUPANCY)
+    target_occupancy = 2
+    n_zero_blocks = min((i32_moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
     n_grid = num_experts + n_zero_blocks
 
-    cache_key = (num_experts, topk, unit_size, n_grid)
+    cache_key = (num_experts, topk, unit_size, n_grid, has_mask)
     cf = _meshless_cf_cache.get(cache_key)
     if cf is not None:
         stream = torch.cuda.current_stream()
         cf(topk_ids, topk_weights,
            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-           moe_buf_i32,
+           moe_buf_i32, expert_mask,
            i32_tokens, i32_moe_buf_elems,
            n_grid,
            fx.Stream(stream))
@@ -1944,12 +2089,13 @@ def launch_meshless_sort_path(
         num_experts=num_experts,
         topk=topk,
         unit_size=unit_size,
+        has_mask=has_mask,
     )
     stream = torch.cuda.current_stream()
     launch_fn(
         topk_ids, topk_weights,
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-        moe_buf_i32,
+        moe_buf_i32, expert_mask,
         i32_tokens, i32_moe_buf_elems,
         n_grid,
         stream=stream,
@@ -1959,7 +2105,7 @@ def launch_meshless_sort_path(
         launch_fn,
         topk_ids, topk_weights,
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-        moe_buf_i32,
+        moe_buf_i32, expert_mask,
         i32_tokens, i32_moe_buf_elems,
         n_grid,
         fx.Stream(stream),
@@ -1970,10 +2116,10 @@ def launch_meshless_sort_path(
 def launch_moe_sorting_prefill_path(
     topk_ids, topk_weights,
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    moe_buf_i32, workspace,
+    moe_buf_i32, workspace, expert_mask,
     i32_tokens, i32_moe_buf_elems, mesh_stride, mesh_size, ws_total,
     *,
-    num_experts, topk, unit_size=UNIT_SIZE,
+    num_experts, topk, unit_size=UNIT_SIZE, has_mask=False,
 ):
     """Low-level launcher for prefill path via HBM workspace.
 
@@ -1983,123 +2129,93 @@ def launch_moe_sorting_prefill_path(
     Uses AOT-compiled dispatch after the first call for each sub-kernel
     to bypass JIT overhead.
     """
-    import torch
 
-    launch_clear_ws, launch_p0, launch_p1, launch_p23, launch_p0v2 = compile_moe_sorting_prefill(
+    (launch_clear_ws, launch_p0, launch_p1, launch_p23,
+     launch_p0v2, launch_p0v2_p23, launch_4k_fused) = compile_moe_sorting_prefill(
         num_experts=num_experts,
         topk=topk,
         unit_size=unit_size,
+        has_mask=has_mask,
     )
 
     stream = torch.cuda.current_stream()
     stream_arg = fx.Stream(stream)
 
-    try:
-        from aiter.jit.utils.chip_info import get_cu_num
-        NUM_CU = get_cu_num()
-    except ImportError:
-        NUM_CU = 304  # MI300X fallback
+    num_cu = torch.cuda.get_device_properties(topk_ids.device).multi_processor_count
 
-    base_key = (num_experts, topk, unit_size)
-    use_p0v2 = i32_tokens <= 512
+    base_key = (num_experts, topk, unit_size, has_mask)
+    use_p0v2 = i32_tokens <= 2048
+
+    target_occupancy = 2
+    n_zero_blocks = min((i32_moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
+    k4_grid = num_experts + n_zero_blocks
 
     if use_p0v2:
-        # P0_v2: no constexpr args
-        ck = base_key + ("p0v2",)
+        ck = base_key + ("p0v2_p23", k4_grid)
         cf = _prefill_cf_cache.get(ck)
         if cf is not None:
-            cf(topk_ids, workspace, i32_tokens, mesh_stride, mesh_size, stream_arg)
+            cf(topk_ids, workspace, topk_weights,
+               sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+               moe_buf_i32, expert_mask,
+               i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
+               k4_grid,
+               stream_arg)
         else:
-            launch_p0v2(topk_ids, workspace, i32_tokens, mesh_stride, mesh_size, stream=stream)
-            cf = flyc.compile(launch_p0v2, topk_ids, workspace, i32_tokens, mesh_stride, mesh_size, stream_arg)
+            launch_p0v2_p23(
+                topk_ids, workspace, topk_weights,
+                sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                moe_buf_i32, expert_mask,
+                i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
+                k4_grid,
+                stream=stream,
+            )
+            cf = flyc.compile(
+                launch_p0v2_p23,
+                topk_ids, workspace, topk_weights,
+                sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                moe_buf_i32, expert_mask,
+                i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
+                k4_grid,
+                stream_arg,
+            )
             _prefill_cf_cache[ck] = cf
-    else:
-        # K1: ClearWorkspace — constexpr n_grid
-        k1_grid = (ws_total + 1023) // 1024
-        ck = base_key + ("clear_ws", k1_grid)
-        cf = _prefill_cf_cache.get(ck)
-        if cf is not None:
-            cf(workspace, ws_total, k1_grid, stream_arg)
-        else:
-            launch_clear_ws(workspace, ws_total, k1_grid, stream=stream)
-            cf = flyc.compile(launch_clear_ws, workspace, ws_total, k1_grid, stream_arg)
-            _prefill_cf_cache[ck] = cf
+        return
 
-        # K2: P0 scatter — constexpr n_grid
-        k2_grid = min(NUM_CU * 2, (i32_tokens * topk + 255) // 256)
-        k2_total = i32_tokens * topk
-        k2_stride = k2_grid * 256
-        k2_niters = (k2_total + k2_stride - 1) // k2_stride
-        ck = base_key + ("p0", k2_grid)
-        cf = _prefill_cf_cache.get(ck)
-        if cf is not None:
-            cf(topk_ids, workspace, i32_tokens, mesh_stride, k2_niters, k2_grid, stream_arg)
-        else:
-            launch_p0(topk_ids, workspace, i32_tokens, mesh_stride, k2_niters, k2_grid, stream=stream)
-            cf = flyc.compile(launch_p0, topk_ids, workspace, i32_tokens, mesh_stride, k2_niters, k2_grid, stream_arg)
-            _prefill_cf_cache[ck] = cf
+    # 4-kernel path (T > 2048): fused clear+p0+p1+p23
+    k1_grid = (ws_total + 1023) // 1024
+    k2_grid = min(num_cu * target_occupancy, (i32_tokens * topk + 255) // 256)
+    k2_total = i32_tokens * topk
+    k2_stride = k2_grid * 256
+    k2_niters = (k2_total + k2_stride - 1) // k2_stride
 
-        # K3: P1 count — no constexpr args
-        ck = base_key + ("p1",)
-        cf = _prefill_cf_cache.get(ck)
-        if cf is not None:
-            cf(workspace, mesh_stride, mesh_size, stream_arg)
-        else:
-            launch_p1(workspace, mesh_stride, mesh_size, stream=stream)
-            cf = flyc.compile(launch_p1, workspace, mesh_stride, mesh_size, stream_arg)
-            _prefill_cf_cache[ck] = cf
-
-    # K4: P23 prefix-sum + mesh scatter — constexpr n_grid
-    K4_OCCUPANCY = 2
-    n_zero_blocks = min((i32_moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, NUM_CU * K4_OCCUPANCY)
-    k4_grid = num_experts + n_zero_blocks
-    ck = base_key + ("p23", k4_grid)
+    ck = base_key + ("4k_fused", k1_grid, k2_grid, k4_grid)
     cf = _prefill_cf_cache.get(ck)
     if cf is not None:
-        cf(workspace, topk_weights,
+        cf(topk_ids, workspace, topk_weights,
            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-           moe_buf_i32,
+           moe_buf_i32, expert_mask,
            i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
-           k4_grid,
+           ws_total, k2_niters,
+           k1_grid, k2_grid, k4_grid,
            stream_arg)
     else:
-        launch_p23(
-            workspace, topk_weights,
+        launch_4k_fused(
+            topk_ids, workspace, topk_weights,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            moe_buf_i32,
+            moe_buf_i32, expert_mask,
             i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
-            k4_grid,
+            ws_total, k2_niters,
+            k1_grid, k2_grid, k4_grid,
             stream=stream,
         )
         cf = flyc.compile(
-            launch_p23,
-            workspace, topk_weights,
+            launch_4k_fused,
+            topk_ids, workspace, topk_weights,
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            moe_buf_i32,
+            moe_buf_i32, expert_mask,
             i32_tokens, mesh_stride, mesh_size, i32_moe_buf_elems,
-            k4_grid,
+            ws_total, k2_niters,
+            k1_grid, k2_grid, k4_grid,
             stream_arg,
         )
         _prefill_cf_cache[ck] = cf
-
-
-# Keep backward-compatible launch_moe_sorting for any external callers
-def launch_moe_sorting(
-    topk_ids, topk_weights,
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    moe_buf_i32, i32_tokens, i32_moe_buf_elems, n_grid_blocks,
-    *,
-    num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE,
-):
-    """Low-level launcher (backward-compatible): dispatches decode path.
-
-    For prefill, use launch_moe_sorting_prefill_path() directly or
-    let moe_sorting_flydsl() auto-dispatch.
-    """
-    launch_moe_sorting_decode_path(
-        topk_ids, topk_weights,
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-        moe_buf_i32, i32_tokens, i32_moe_buf_elems, n_grid_blocks,
-        num_experts=num_experts, topk=topk,
-        max_tokens=max_tokens, unit_size=unit_size,
-    )
