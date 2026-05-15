@@ -770,6 +770,56 @@ def bench_eager_us(fn, warmup=BENCH_WARMUP, iters=BENCH_MEASURE, flush_l2=True):
     return latencies[len(latencies) // 2]
 
 
+def bench_kernel_us(fn, warmup=BENCH_WARMUP, iters=BENCH_MEASURE):
+    """Pure on-device kernel time (per invocation, microseconds).
+
+    Uses ``torch.profiler`` (CUPTI on CUDA, roctracer on ROCm) to capture
+    per-kernel begin/end timestamps from the GPU command processor itself.
+    The returned figure sums every GPU kernel that ran during ``iters``
+    invocations of ``fn`` and divides by ``iters``.
+
+    Compared to ``bench_graph_us``:
+      - ``bench_graph_us`` measures end-to-end CUDA-graph replay latency,
+        which still includes graph-replay overhead and any inter-kernel
+        dispatch gaps on the GPU command processor.
+      - ``bench_kernel_us`` measures only the wall time the GPU is actually
+        executing kernels — i.e. the floor on kernel runtime, with launch
+        and dispatch effects removed.
+
+    For multi-kernel paths (e.g. unfused gating + sort) this returns the
+    sum of all per-kernel durations, which is the right comparison point
+    for fusion: it isolates how much on-device compute fusion saved,
+    independent of dispatch / scheduler effects.
+    """
+    try:
+        from torch.profiler import profile, ProfilerActivity
+    except ImportError:
+        return None
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    try:
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+    except Exception:
+        return None
+
+    total_us = 0.0
+    for k in prof.key_averages():
+        # Sum events with non-zero on-device dwell. This naturally excludes
+        # host-side stubs like hipModuleLaunchKernel / cudaLaunchKernel and
+        # hipDeviceSynchronize / cudaDeviceSynchronize, whose self_device_time
+        # is 0 because no work runs on the GPU under their name.
+        sd = getattr(k, "self_device_time_total", 0.0)
+        if sd > 0:
+            total_us += sd
+    return total_us / iters
+
+
 def bench_graph_us(fn, warmup=BENCH_WARMUP, iters=BENCH_MEASURE):
     """CUDA graph benchmark — amortizes kernel launch overhead."""
     for _ in range(warmup):
@@ -809,8 +859,8 @@ def run_bench_comparison(token_sweep=None):
     """Benchmark FlyDSL vs CK (aiter) across T values in eager and graph modes."""
     try:
         from aiter.fused_moe import moe_sorting as aiter_moe_sorting
-    except ImportError:
-        print("  aiter not available, skipping CK comparison")
+    except (ImportError, AttributeError) as e:
+        print(f"  aiter not available ({type(e).__name__}: {e}), skipping CK comparison")
         aiter_moe_sorting = None
 
     E, topk, model_dim = 256, 8, 4096
@@ -825,11 +875,14 @@ def run_bench_comparison(token_sweep=None):
     print(f"  Device: {torch.cuda.get_device_name(0)}")
     props = torch.cuda.get_device_properties(0)
     print(f"  CUs: {props.multi_processor_count}, decode threshold: T<={sub_tokens}")
-    print(f"  Modes: eager (with L2 flush, median of {BENCH_MEASURE}), graph ({BENCH_MEASURE} replays)")
-    print(f"{'=' * 110}")
-    print(f"{'T':>6s} | {'Path':>7s} | {'FLY eager':>10s} | {'FLY graph':>10s} | "
-          f"{'CK eager':>10s} | {'CK graph':>10s} | {'Eager':>7s} | {'Graph':>7s}")
-    print("-" * 110)
+    print(f"  Modes: eager (with L2 flush, median of {BENCH_MEASURE}), graph ({BENCH_MEASURE} replays), "
+          f"kernel (on-device dwell)")
+    print(f"{'=' * 140}")
+    print(f"{'T':>6s} | {'Path':>7s} | "
+          f"{'FLY eager':>10s} | {'FLY graph':>10s} | {'FLY kern':>10s} | "
+          f"{'CK eager':>10s} | {'CK graph':>10s} | {'CK kern':>10s} | "
+          f"{'Eager':>7s} | {'Graph':>7s} | {'Kern':>7s}")
+    print("-" * 140)
 
     for T in token_sweep:
         torch.manual_seed(42)
@@ -855,12 +908,13 @@ def run_bench_comparison(token_sweep=None):
             moe_sorting_flydsl(topk_ids, topk_weights,
                                fly_sorted_ids, fly_sorted_w, fly_sorted_eids,
                                fly_nvalid, fly_moe_buf_2d,
-                               E, unit_size)
+                               E, UNIT_SIZE)
 
         fly_eager = bench_eager_us(fly_fn)
         fly_graph = bench_graph_us(fly_fn)
+        fly_kernel = bench_kernel_us(fly_fn)
 
-        ck_eager, ck_graph = None, None
+        ck_eager, ck_graph, ck_kernel = None, None, None
         if aiter_moe_sorting is not None:
             def ck_fn():
                 aiter_moe_sorting(topk_ids, topk_weights, E,
@@ -868,6 +922,7 @@ def run_bench_comparison(token_sweep=None):
                                   block_size=UNIT_SIZE)
             ck_eager = bench_eager_us(ck_fn)
             ck_graph = bench_graph_us(ck_fn)
+            ck_kernel = bench_kernel_us(ck_fn)
 
         def fmt(v):
             return f"{v:8.1f}us" if v is not None else "       N/A"
@@ -878,12 +933,15 @@ def run_bench_comparison(token_sweep=None):
             r = a / b
             return f"  {r:.2f}x"
 
-        print(f"{T:>6d} | {path:>7s} | {fmt(fly_eager)} | {fmt(fly_graph)} | "
-              f"{fmt(ck_eager)} | {fmt(ck_graph)} | "
-              f"{ratio(fly_eager, ck_eager)} | {ratio(fly_graph, ck_graph)}")
+        print(f"{T:>6d} | {path:>7s} | "
+              f"{fmt(fly_eager)} | {fmt(fly_graph)} | {fmt(fly_kernel)} | "
+              f"{fmt(ck_eager)} | {fmt(ck_graph)} | {fmt(ck_kernel)} | "
+              f"{ratio(fly_eager, ck_eager)} | {ratio(fly_graph, ck_graph)} | "
+              f"{ratio(fly_kernel, ck_kernel)}")
 
-    print("=" * 110)
-    print("  Ratio < 1.0 = FlyDSL faster. Eager includes launch overhead. Graph amortizes it.")
+    print("=" * 140)
+    print("  Ratio < 1.0 = FlyDSL faster. Eager includes host launch overhead;")
+    print("  Graph amortizes launch but includes dispatch gaps; Kern is pure on-GPU kernel time.")
     print()
 
 
@@ -920,11 +978,14 @@ def run_fused_bench_comparison(token_sweep=None, dtype_str="bf16",
           f"model_dim={model_dim}, unit_size={UNIT_SIZE})")
     print(f"  Device: {torch.cuda.get_device_name(0)}")
     print(f"  Modes: eager (with L2 flush, median of {BENCH_MEASURE}), "
-          f"graph ({BENCH_MEASURE} replays)")
-    print(f"{'=' * 110}")
-    print(f"{'T':>6s} | {'Path':>9s} | {'unfused eager':>14s} | {'fused eager':>13s} | "
-          f"{'unfused graph':>14s} | {'fused graph':>13s} | {'Eager':>7s} | {'Graph':>7s}")
-    print("-" * 110)
+          f"graph ({BENCH_MEASURE} replays), kernel (sum of on-device kernel time)")
+    print(f"{'=' * 145}")
+    print(f"{'T':>6s} | {'Path':>9s} | "
+          f"{'unfused eager':>14s} | {'fused eager':>13s} | "
+          f"{'unfused graph':>14s} | {'fused graph':>13s} | "
+          f"{'unfused kern':>13s} | {'fused kern':>12s} | "
+          f"{'Eager':>7s} | {'Graph':>7s} | {'Kern':>7s}")
+    print("-" * 145)
 
     # Cache the standalone gating launcher so the unfused path doesn't pay
     # compile time inside the measured region.
@@ -977,11 +1038,13 @@ def run_fused_bench_comparison(token_sweep=None, dtype_str="bf16",
         fused_eager = bench_eager_us(fused_fn)
         unfused_graph = bench_graph_us(unfused_fn)
         fused_graph = bench_graph_us(fused_fn)
+        unfused_kernel = bench_kernel_us(unfused_fn)
+        fused_kernel = bench_kernel_us(fused_fn)
 
         path = "fused" if T <= 16 else "fallback"
 
-        def fmt(v):
-            return f"{v:12.1f}us" if v is not None else "         N/A"
+        def fmt(v, w=12):
+            return f"{v:{w}.1f}us" if v is not None else f"{'N/A':>{w + 2}s}"
 
         def ratio(unfused, fused):
             if unfused is None or fused is None or fused == 0:
@@ -990,14 +1053,18 @@ def run_fused_bench_comparison(token_sweep=None, dtype_str="bf16",
             r = unfused / fused
             return f"  {r:.2f}x"
 
-        print(f"{T:>6d} | {path:>9s} | {fmt(unfused_eager)} | {fmt(fused_eager)} | "
+        print(f"{T:>6d} | {path:>9s} | "
+              f"{fmt(unfused_eager)} | {fmt(fused_eager)} | "
               f"{fmt(unfused_graph)} | {fmt(fused_graph)} | "
+              f"{fmt(unfused_kernel, 11)} | {fmt(fused_kernel, 10)} | "
               f"{ratio(unfused_eager, fused_eager)} | "
-              f"{ratio(unfused_graph, fused_graph)}")
+              f"{ratio(unfused_graph, fused_graph)} | "
+              f"{ratio(unfused_kernel, fused_kernel)}")
 
-    print("=" * 110)
-    print("  Ratio > 1.0 = fused faster than (gating + moe_sorting). Eager includes "
-          "launch overhead (2 launches vs 1); Graph amortizes it.")
+    print("=" * 145)
+    print("  Ratio > 1.0 = fused faster. Eager includes host launch overhead (2 launches vs 1);")
+    print("  Graph amortizes launch but still includes inter-kernel dispatch gaps;")
+    print("  Kern is pure on-GPU kernel time (sum of per-kernel device dwell, via torch.profiler).")
     print()
 
 
